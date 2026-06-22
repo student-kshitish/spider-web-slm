@@ -1,0 +1,52 @@
+# Spider Web SLM Project Constitution
+# Target: 6.5M Parameter Sniper Model
+# Lead Developer: KSHITISH-BEHERA
+
+## 🌌 Project Identity
+- **Name**: Spider Web SLM with Solar Ring Memory (SRM).
+- **Core Philosophy**: A dynamic graph-based model using Chaos Theory (Lorenz) for routing and Orbital Mechanics (SRM) for memory.
+- **Strict Prohibition**: This is NOT a Transformer. DO NOT suggest Attention, Multi-Head Attention, or standard KV-caches.
+
+## 🕸️ Architectural Mandatory Rules
+- **SRM Update Rule**: $M_{new} = \alpha \cdot M_{old} + \beta \cdot (\sigma(W_g(h)) \odot h)$. Never replace this with RNN/LSTM gates.
+- **Lorenz Gate**: 
+    - Must use clamped Euler integration ($dt=0.005$).
+    - Must maintain the Jacobian Guard ($h = h + \epsilon \cdot f(h)$).
+    - Projections must use `spectral_norm` for ODE stability.
+- **WebNode Topology**:
+    - Execution Flow: `Input → SwiGLU MLP → Lorenz Router → Ring-Hops → SRM Update → Output`.
+    - Rings are circular ($Node_{7}$ connects to $Node_{0}$).
+- **Positioning**: 
+    - Use **3-Axis Polar RoPE** (Temporal, Angular, Radial). No absolute positions.
+
+## 🛡️ Numerical Stability & NaN Prevention
+- **Priority**: Stability > Throughput.
+- **Normalization**: Use `nn.RMSNorm` on all node outputs and memory reads.
+- **Clamping**: Lorenz states must be clamped to $[-15, 15]$ (or as defined in `config.py`).
+- **Precision**: Default to `torch.bfloat16`. Avoid `float16` to prevent gradient underflow in chaotic gates.
+
+## 🏎️ Hardware Optimization (RTX 5050 / Blackwell)
+- **Memory**: Maximize the 8GB VRAM using `set_to_none=True` in optimizers.
+- **Throughput**: Utilize `fused=True` in `AdamW` and `non_blocking=True` for H2D transfers.
+- **Compilation**: Support `torch.compile` boundaries; keep the core ODE loop "traceable."
+
+## 🎓 Curriculum Training Logic
+- **Phase 1 (Atomic)**: Verifying SRM physics. No routing.
+- **Phase 2 (Structural)**: Language foundations. Memory only.
+- **Phase 3 (Soft Chaos)**: Soft routing (Softmax) with high temperature ($\tau \approx 5.0$).
+- **Phase 4 (Hard Logic)**: Discrete routing (Gumbel-STE) with low temperature ($\tau \approx 0.1$).
+
+## 📝 Code Style & Conventions
+- **Naming**: 
+    - `h`: Hidden state.
+    - `M`: Memory slots.
+    - `tau`: Temperature.
+    - `logits`: Output or Routing signals.
+- **Modularity**: One class per file in `core/`. No monolithic implementations.
+- **Comments**: Focus on the 'Why' (the math) rather than the 'What' (the code).
+
+## 🚫 Forbidden Suggestions
+- DO NOT suggest `nn.MultiheadAttention`.
+- DO NOT suggest `nn.LSTM` or `nn.GRU`.
+- DO NOT suggest `argmax` for routing during training phases.
+- DO NOT use `float64` or heavy double-precision math.

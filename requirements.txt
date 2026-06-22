@@ -1,0 +1,7 @@
+
+torch>=2.3.0
+sentencepiece>=0.2.0
+datasets>=2.18.0
+wandb>=0.17.0
+bitsandbytes>=0.43.0
+pytest>=8.0.0

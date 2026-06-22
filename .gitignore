@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+checkpoints/
+data/raw/
+wandb/
+logs/
+*.log
+*.csv
+RESUME_TOMORROW.txt
+diag_*.py
+watch_*.py
+recover_*/
