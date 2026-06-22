@@ -208,11 +208,11 @@ spider-web-slm/
 
 ## Honest Framing
 
-Spider Web SLM is a **proof of concept**, not a competitive language model.
+Spider Web SLM is a **proof of concept and a work in progress**, not a competitive language model. It is being actively developed with the goal of improving its capabilities over time.
 
-It demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a constant-memory sequential context store whose activation footprint grows sub-linearly with sequence length.
+In its current state it demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a constant-memory sequential context store whose activation footprint grows sub-linearly with sequence length. These are the foundations the project is building on — not the ceiling.
 
-It does **not** demonstrate that chaos routing outperforms a comparably-sized transformer. The planned ablation comparing the Lorenz router against an identically-structured linear router (same parameters, same training budget) was interrupted early. The preliminary result at step 3 600 showed the linear router slightly ahead in CE — suggesting that at this scale, the routing mechanism is unlikely to be the performance bottleneck. Data volume, model depth, and training budget dominate.
+It does not yet demonstrate that chaos routing outperforms a comparably-sized transformer. The planned ablation comparing the Lorenz router against an identically-structured linear router (same parameters, same training budget) was interrupted early. The preliminary result at step 3,600 showed the linear router slightly ahead in cross-entropy — suggesting that at this scale the routing mechanism is unlikely to be the performance bottleneck, and that data volume, model depth, and training budget dominate. Closing that question with a full-budget ablation is part of ongoing work.
 
 ---
 
