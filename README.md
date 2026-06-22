@@ -91,30 +91,43 @@ The top-2 tokens account for 65% of probability mass and are the two most freque
 
 ## Memory Scaling
 
-The central architectural claim of SRM is constant activation cost in sequence length, unlike the O(T) KV cache or O(T²) attention matrix of standard transformers. This was measured empirically.
+The central architectural claim of SRM is constant activation cost in sequence length, unlike the O(T) KV cache or O(T²) attention matrix of standard transformers. This was measured with a parameter-matched baseline.
+
+### Baseline: parameter-matched transformer
+
+To give an honest comparison, the baseline is a standard causal decoder-only transformer sized to match Spider Web's 3.48 M params (dim=128, heads=4, ff_mult=4, 11 layers, explicit causal mask → 3.45 M params, 0.87% delta). Earlier experiments compared against a single-layer 0.37 M-param model, which was not a fair test.
+
+> **Note:** The model was trained on seq_len=128. Quality beyond that is undefined. The measurement below tests the *architectural scaling property* only.
 
 ### Activation memory vs sequence length (batch=1)
 
-> **Note:** The model was trained on seq_len=128. Quality beyond that is undefined. The measurement below tests the *architectural scaling property*, not generation quality at longer contexts.
-
-| seq_len | Spider Web MB | Self-attention MB | Attn/SW ratio |
-|--------:|:-------------:|:-----------------:|:-------------:|
-| 64 | 15.8 | 0.2 | 0.01× |
-| 128 | 6.7 | 0.3 | 0.04× |
-| 256 | 10.4 | 0.6 | 0.06× |
-| 512 | 13.8 | 2.1 | 0.16× |
-| 1024 | 28.7 | 7.8 | 0.27× |
-| 2048 | **42.8** | **29.5** | 0.69× |
+| seq_len | Spider Web MB | Matched Transformer MB | MT/SW ratio |
+|--------:|:-------------:|:----------------------:|:-----------:|
+| 64 | 5.5 | 6.0 | 1.09× |
+| 128 | 7.6 | 7.7 | 1.01× |
+| 256 | 9.1 | 9.2 | 1.01× |
+| 512 | 13.9 | 11.9 | 0.86× |
+| 1024 | 30.4 | 21.2 | 0.70× |
+| 2048 | **42.8** | **43.8** | 1.02× |
 
 Over a **32× sequence-length increase** (64 → 2048 tokens):
-- Spider Web activation memory grew **2.7×** — sub-linear, approximately O(T)
-- Self-attention activation memory grew **147×** — quadratic, O(T²), as expected
+- Spider Web activation memory grew **7.8×**
+- Matched Transformer activation memory grew **7.3×**
 
-### Honest caveats
+The growth rates are nearly identical. SRM's theoretical O(1) advantage does not manifest within the tested range against a same-capacity transformer. Both architectures grow at similar rates here because the transformer's attention matrix (T²) is computed in bfloat16 and immediately freed under `torch.no_grad()`, while Spider Web's per-node SRM expansions and routing bookkeeping accumulate comparable overhead.
 
-**The baseline is under-sized.** The attention comparison uses a single-layer 0.37 M-param model vs Spider Web's full 3.48 M-param model. Spider Web carries high baseline activation cost (hop loop bookkeeping, per-node SRM tensor expansions, spectral-norm layers). Against a same-capacity multi-layer transformer, the crossover where SRM uses less memory would occur somewhere around 256–512 tokens — not beyond 2048. The growth *rate* comparison (2.7× vs 147×) is valid; the absolute figures favour attention at the tested lengths.
+### Throughput vs sequence length (tokens/second, batch=1)
 
-**The hop loop is serial.** Spider Web processes tokens ring-by-ring through a sequential hop loop rather than with a fully parallelised attention matrix. Forward-pass time grows from ~160 ms to ~400 ms over the same 32× length increase. At the same parameter count, Spider Web's per-token throughput is lower than an equivalent transformer. This is a real practical cost that should not be glossed over.
+| seq_len | Spider Web tok/s | Matched Transformer tok/s | MT/SW ratio |
+|--------:|:----------------:|:-------------------------:|:-----------:|
+| 64 | 395 | 27,915 | 70.7× |
+| 128 | 570 | 56,054 | 98.3× |
+| 256 | 927 | 114,218 | 123.3× |
+| 512 | 1,580 | 227,198 | 143.8× |
+| 1024 | 2,927 | 436,002 | 149.0× |
+| 2048 | 5,283 | 346,312 | 65.6× |
+
+The matched transformer is **65–149× faster** throughout. This is the dominant practical cost of Spider Web in its current form: the hop loop processes tokens sequentially ring-by-ring, while the transformer parallelises the entire sequence across all layers in a single fused kernel. This is a fundamental difference in execution model, not a tuning gap.
 
 ---
 
@@ -206,11 +219,21 @@ spider-web-slm/
 
 ---
 
+## CE vs Published Baselines
+
+Spider Web's eval CE is **4.77** (50-batch average on the TinyStories training distribution, 5K SentencePiece vocabulary). The random baseline is log(5000) = 8.52, so this represents a **44% reduction from random**.
+
+Direct comparison against the Eldan & Li 2023 TinyStories paper baselines is not valid. The paper uses a 10K GPT-2-derived vocabulary; CE is tokenizer-relative, and a larger vocabulary inflates CE by construction (log(10000) = 9.21 random baseline vs our 8.52). The TinyStories paper also does not report CE in a table — evaluation is GPT-4 quality scoring on grammar, creativity, and consistency, not a numeric loss. No apples-to-apples numeric comparison exists.
+
+Community reimplementations of TinyStories at comparable parameter counts, but with full training budgets (many more steps, often on GPU clusters), report significantly lower loss. Spider Web's current CE reflects a 20,000-step single-GPU proof-of-concept run, not an optimised training campaign.
+
+---
+
 ## Honest Framing
 
 Spider Web SLM is a **proof of concept and a work in progress**, not a competitive language model. It is being actively developed with the goal of improving its capabilities over time.
 
-In its current state it demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a constant-memory sequential context store whose activation footprint grows sub-linearly with sequence length. These are the foundations the project is building on — not the ceiling.
+In its current state it demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a fixed-size sequential context store. The fair parameter-matched scaling test (above) shows that SRM's theoretical O(1) memory advantage does not yet translate into a practical advantage at the tested sequence lengths — both architectures grow at similar rates up to 2048 tokens. A real advantage would require much longer contexts than those tested, and would need to be weighed against the 65–149× throughput deficit from the serial hop loop.
 
 It does not yet demonstrate that chaos routing outperforms a comparably-sized transformer. The planned ablation comparing the Lorenz router against an identically-structured linear router (same parameters, same training budget) was interrupted early. The preliminary result at step 3,600 showed the linear router slightly ahead in cross-entropy — suggesting that at this scale the routing mechanism is unlikely to be the performance bottleneck, and that data volume, model depth, and training budget dominate. Closing that question with a full-budget ablation is part of ongoing work.
 
