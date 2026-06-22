@@ -122,18 +122,16 @@ Over a **32× sequence-length increase** (64 → 2048 tokens):
 
 Probed with inference tests (temp=0.6, top_k=30, ngram=3, stop_at_sentence).
 
-| Capability | Verdict | Evidence |
-|------------|:-------:|---------|
-| Syntactic slot-filling (POS) | ✓ | Correct grammatical category for copula completions |
-| Local next-token prediction | ✓ | 65% mass on correct character nouns |
-| Genre / register completion | ✓ | `big`/`little` predicted after "princess who lived in a" |
-| Dialogue punctuation | ✓ | 64.6% on `,` after "he said hello and she said" |
-| Cross-sentence coreference | ✗ | `ball` absent from top-5 after two-sentence setup |
-| Numeric state tracking | ✗ | 49.8% on `a` after explicit counting context |
-| Causal inference | ✗ | `mom` (21.6%) after "raining so she took her" |
-| Relational reasoning | ✗ | Topic drift + flat distribution on all reasoning probes |
+| Capability | Evidence |
+|------------|---------|
+| Syntactic slot-filling (POS) | Correct grammatical category for copula completions |
+| Local next-token prediction | 65% probability mass on correct character nouns |
+| Genre / register completion | `big`/`little` predicted after "princess who lived in a" |
+| Dialogue punctuation | 64.6% on `,` after "he said hello and she said" |
 
-The capability cliff is sharp at sentence boundaries. Within a single sentence the model has solid syntactic and lexical associations. Across sentence boundaries — coreference, numeric carry-over, causal grounding — it has no reliable representation. **This is a scale-driven limitation, not an architecture-specific one**: 3.5 M params trained on 43 MB has insufficient capacity for multi-hop reasoning regardless of routing mechanism.
+Within a single sentence the model shows solid syntactic and lexical associations — the right grammatical slot is filled, frequent collocations are predicted confidently, and surface patterns like dialogue punctuation are well-learned.
+
+As expected for a 3.48 M-parameter model trained on TinyStories, capabilities requiring cross-sentence binding — coreference, numeric state tracking, causal inference, and relational reasoning — are out of range. These reflect model scale and training corpus, not the routing architecture specifically.
 
 ---
 
