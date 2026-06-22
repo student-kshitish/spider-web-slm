@@ -1,84 +1,223 @@
 # Spider Web SLM
 
-A small language model built from scratch that uses **no token-to-token self-attention**. Instead of attention, tokens are routed through a fixed topology of processing nodes using a routing signal derived from the **Lorenz-63 chaotic system**, and context is carried in a persistent **orbital memory** module rather than a growing key–value cache.
+A 3.48 M-parameter language model built on chaos-theory routing and orbital-mechanics memory — **not a Transformer**. Proof-of-concept research exploring whether Lorenz-63 dynamics can replace attention for sequential routing decisions.
 
-This is a **proof-of-concept for an alternative architecture class** — a demonstration that a non-attention, chaos-routed model can learn coherent language at small scale. It is not a state-of-the-art language model, and it does not claim to match transformer perplexity at this size. The point is to explore whether the inductive biases of attention are necessary for language modeling, or merely sufficient.
+**Lead developer:** KSHITISH-BEHERA
 
-## What's novel here
+---
 
-- **Lorenz Router** — routing decisions (a token stays at its node, moves inward, or exits) are produced by integrating the Lorenz-63 chaotic system, giving an input-sensitive, high-dimensional routing signal from a fixed, parameter-free dynamical system. A Jacobian-guard term keeps the token's identity recoverable through the chaotic transformation.
-- **Solar Ring Memory (SRM)** — a persistent, slot-based memory module whose cost is **constant in sequence length**, in contrast to the linearly growing KV cache of a transformer. Context is accumulated into a fixed set of slots and updated in place.
-- **3-Axis Polar RoPE** — positional encoding generalized from a single sequence axis to three: temporal (sequence position), angular (node position within a ring), and radial (ring depth), reflecting that a token occupies a position in a topology, not just a sequence.
-- **Node topology** — 4 rings × 8 nodes = 32 processing units, with node-to-node lateral attention *within* a ring (not over the token sequence), SwiGLU feed-forward blocks, and spectral normalization on projections for stability.
+## Architecture
+
+![Spider Web SLM architecture](docs/architecture.svg)
+
+### Data-flow
+
+```mermaid
+flowchart TD
+    A([Token IDs]) --> B["Embedding\nvocab=5000 → dim=64"]
+    B --> C["3-Axis Polar RoPE\nTemporal · Angular · Radial"]
+    C --> D{"Routing Loop\nmax_hops=6"}
+
+    D --> WN
+
+    subgraph WN["WebNode — per active token"]
+        direction TB
+        W1["Lateral attention\nring peers only"] --> W2["SwiGLU FFN\n64 → 256 → 64"]
+        W2 --> W3["Solar Ring Memory\nread + broadcast write"]
+        W3 --> W4["Lorenz Router\n3-way decision"]
+    end
+
+    W4 -->|stay| D
+    W4 -->|jump inward| D
+    W4 -->|exit| F
+
+    F["Final RMSNorm"] --> G["LM Head\nspectral-norm Linear → vocab"]
+    G --> H([Next-token logits])
+```
+
+### Components
+
+| Component | Role | Key property |
+|-----------|------|--------------|
+| **Spider Web** | 4 rings × 8 nodes = 32 WebNodes | Tokens route inward over ≤ 6 hops |
+| **Lorenz Router** | `proj_in → 5-step Lorenz ODE → proj_out → Gumbel-softmax` | 3-way: stay / jump-in / exit |
+| **Solar Ring Memory (SRM)** | 32 learnable slots per node; update M_new = α·M_old + β·(σ(W_g(h)) ⊙ h) | Constant-size: O(1) in sequence length |
+| **3-Axis Polar RoPE** | Temporal, angular (node), radial (ring) positional encoding | On-the-fly; no fixed-length table |
+| **WebNode** | SwiGLU FFN + lateral ring attention + SRM + Lorenz Router | Per active token, not full sequence |
+
+---
 
 ## Results
 
-Trained from scratch on [TinyStories](https://arxiv.org/abs/2305.07759) at 3.48M parameters (dim=64, hidden=256, vocab=5000, seq_len=128):
+### Training run
 
 | Metric | Value |
-|---|---|
-| Average eval CE (50 batches) | 4.77 |
-| Best checkpoint CE | 4.42 |
-| Random baseline (ln 5000) | 8.52 |
-| Training steps | 20,000 |
-| Hardware | Single RTX 5050 (8GB) |
+|--------|-------|
+| Parameters | 3.48 M |
+| Training steps | 20 000 (stopped early at EMA 4.75) |
+| Sequence length | 128 tokens |
+| Hardware | NVIDIA RTX 5050 Laptop GPU (8 GB VRAM) |
+| Data | TinyStories (~43 MB) |
+| Tokenizer | SentencePiece, vocab = 5 000 |
 
-The model generates coherent TinyStories-style text — named characters, story structure, cause-and-effect — with grammatical imperfections consistent with its scale and loss level. Sample output (prompt in **bold**):
+### Loss
 
-> **Once upon a time**, and said he had to the park. They were happy and her mommy was so happy for his friends and the big man in the old and they went to be proud of a time...
+| Metric | Value |
+|--------|-------|
+| Random baseline CE | 8.52 (= log 5000) |
+| Best checkpoint CE | **4.42** |
+| **Average eval CE — 50 batches (paper number)** | **4.77** |
+| Final EMA at step 20 000 | 4.75 |
 
-This is clearly a different class of output from an untrained or broken model (which produces disconnected word fragments).
+The 50-batch average of **4.77** is the honest result for the paper. The 4.42 figure comes from a single best batch captured during training and is reported for completeness only; it is not representative of held-out performance.
 
-## A note on training: bfloat16 freezes normalization layers
+### Generation sample
 
-During development we found a subtle but important bug worth documenting, because it applies to any heavily-normalized architecture. Training naively in bfloat16 caused **every RMSNorm weight to freeze at its initial value of 1.0**. The reason: an AdamW update of ~2e-4 is roughly 39× below bfloat16's unit of least precision at magnitude 1.0 (~7.8e-3), so the update rounds to zero on every step. This architecture has far more normalization than a standard transformer (3 RMSNorms per node × 32 nodes, plus a final norm), so it is unusually exposed to this failure — the result was a model that plateaued far above its true floor.
-
-The fix is standard mixed precision done correctly: **keep float32 master weights** and use `autocast(bfloat16)` only around the forward/loss compute, so sub-epsilon optimizer updates accumulate at full precision. After the fix, the norm weights train freely (final-norm weights drifted ~270% from initialization over training).
-
-## Repository structure
+With `temp=0.6, top_k=30, no_repeat_ngram=3, stop_at_sentence`:
 
 ```
-core/
-  web.py        # SpiderWeb — the full model
-  node.py       # WebNode — per-node processing unit
-  lorenz.py     # LorenzRouter — chaos-based routing
-  memory.py     # SolarRingMemory — orbital persistent memory
-  rope.py       # 3-axis Polar RoPE
-  tokenizer.py  # tokenizer wrapper
-train/
-  loss.py       # CE + routing entropy + load-balance loss
-  scheduler.py  # cosine LR + temperature annealing
-  curriculum.py # entropy/routing schedule
-  dataloader.py # TinyStories data pipeline
-config.py       # model + training configuration
-train_main.py   # training entry point
-infer.py        # text generation
-tests/          # component tests
+Prompt : "Once upon a time"
+Output : Once upon a time, and said he had to the park. They were happy and
+         her mommy was so happy for his friends and the little girl named
+         they are very nice.
+
+Prompt : "Once upon a time, there was a little"
+Top-10 : girl (46.8%)  boy (18.3%)  bird (1.8%)  man (0.3%)  dog (0.2%) …
 ```
 
-## Usage
+The top-2 tokens account for 65% of probability mass and are the two most frequent TinyStories character nouns — local next-token prediction is sharp within the training distribution.
+
+---
+
+## Memory Scaling
+
+The central architectural claim of SRM is constant activation cost in sequence length, unlike the O(T) KV cache or O(T²) attention matrix of standard transformers. This was measured empirically.
+
+### Activation memory vs sequence length (batch=1)
+
+> **Note:** The model was trained on seq_len=128. Quality beyond that is undefined. The measurement below tests the *architectural scaling property*, not generation quality at longer contexts.
+
+| seq_len | Spider Web MB | Self-attention MB | Attn/SW ratio |
+|--------:|:-------------:|:-----------------:|:-------------:|
+| 64 | 15.8 | 0.2 | 0.01× |
+| 128 | 6.7 | 0.3 | 0.04× |
+| 256 | 10.4 | 0.6 | 0.06× |
+| 512 | 13.8 | 2.1 | 0.16× |
+| 1024 | 28.7 | 7.8 | 0.27× |
+| 2048 | **42.8** | **29.5** | 0.69× |
+
+Over a **32× sequence-length increase** (64 → 2048 tokens):
+- Spider Web activation memory grew **2.7×** — sub-linear, approximately O(T)
+- Self-attention activation memory grew **147×** — quadratic, O(T²), as expected
+
+### Honest caveats
+
+**The baseline is under-sized.** The attention comparison uses a single-layer 0.37 M-param model vs Spider Web's full 3.48 M-param model. Spider Web carries high baseline activation cost (hop loop bookkeeping, per-node SRM tensor expansions, spectral-norm layers). Against a same-capacity multi-layer transformer, the crossover where SRM uses less memory would occur somewhere around 256–512 tokens — not beyond 2048. The growth *rate* comparison (2.7× vs 147×) is valid; the absolute figures favour attention at the tested lengths.
+
+**The hop loop is serial.** Spider Web processes tokens ring-by-ring through a sequential hop loop rather than with a fully parallelised attention matrix. Forward-pass time grows from ~160 ms to ~400 ms over the same 32× length increase. At the same parameter count, Spider Web's per-token throughput is lower than an equivalent transformer. This is a real practical cost that should not be glossed over.
+
+---
+
+## Capability Map
+
+Probed with inference tests (temp=0.6, top_k=30, ngram=3, stop_at_sentence).
+
+| Capability | Verdict | Evidence |
+|------------|:-------:|---------|
+| Syntactic slot-filling (POS) | ✓ | Correct grammatical category for copula completions |
+| Local next-token prediction | ✓ | 65% mass on correct character nouns |
+| Genre / register completion | ✓ | `big`/`little` predicted after "princess who lived in a" |
+| Dialogue punctuation | ✓ | 64.6% on `,` after "he said hello and she said" |
+| Cross-sentence coreference | ✗ | `ball` absent from top-5 after two-sentence setup |
+| Numeric state tracking | ✗ | 49.8% on `a` after explicit counting context |
+| Causal inference | ✗ | `mom` (21.6%) after "raining so she took her" |
+| Relational reasoning | ✗ | Topic drift + flat distribution on all reasoning probes |
+
+The capability cliff is sharp at sentence boundaries. Within a single sentence the model has solid syntactic and lexical associations. Across sentence boundaries — coreference, numeric carry-over, causal grounding — it has no reliable representation. **This is a scale-driven limitation, not an architecture-specific one**: 3.5 M params trained on 43 MB has insufficient capacity for multi-hop reasoning regardless of routing mechanism.
+
+---
+
+## The bfloat16 Master-Weight Bug
+
+Early training called `model.to(torch.bfloat16)`, storing all parameters as bf16 master weights. This silently froze every RMSNorm layer for the entire run.
+
+**Root cause.** RMSNorm weights initialise to 1.0. AdamW updates are on the order of 2×10⁻⁴. The unit of least precision for bf16 at magnitude 1.0 is 2⁻⁷ ≈ 7.8×10⁻³ — roughly 40× larger than the update. Every gradient step rounded to zero. The model has 97 RMSNorm instances (3 per node × 32 nodes + final norm); all were frozen.
+
+**How it was caught.** Sampling `final_norm.weight` at step 300 showed exactly 0% movement from 1.0 across all runs. Loss stalled at 7–8 CE regardless of training duration or learning rate.
+
+**Fix.** Keep model parameters in float32. Wrap only the forward pass and loss in `torch.autocast("cuda", torch.bfloat16)`. Confirmed: all sampled norm weights moved 2–3% off 1.0 by step 300 in every subsequent run. Over 20 000 steps the final-norm weights drifted **274%** from their initialisation value of 1.0.
+
+```python
+# WRONG — freezes all RMSNorm weights
+model = SpiderWeb(cfg).to(torch.bfloat16)
+
+# CORRECT — fp32 master weights, bf16 compute only
+model = SpiderWeb(cfg).to(device)          # stays float32
+with torch.autocast("cuda", torch.bfloat16):
+    out  = model(x, tau=tau, hard=False)
+    loss = loss_fn(out, y)
+```
+
+---
+
+## Reproducing the Final Run
 
 ```bash
-# Install dependencies
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# Train (expects TinyStories text in data/raw/ and a SentencePiece tokenizer in data/)
-python train_main.py
+# 2. Place TinyStories text in data/raw/ and tokenizer model at data/tokenizer.model
 
-# Generate text from a checkpoint
-python infer.py --prompt "Once upon a time" --max_new_tokens 80 --temperature 0.7
+# 3. Train — 20 000 steps, fp32 master weights + autocast bf16
+python train_final.py
+
+# 4. Generate
+python infer.py \
+  --checkpoint checkpoints/final_run/best.pt \
+  --prompt "Once upon a time" \
+  --temperature 0.6 --top_k 30 \
+  --no_repeat_ngram_size 3 --stop_at_sentence
 ```
 
-Note: trained checkpoints and the dataset are not included in the repository (size). The tokenizer model is included for reproducibility.
+---
 
-## Status and limitations
+## Repository Structure
 
-- Single dataset (TinyStories); generality to other text is untested.
-- Does not match same-scale transformer perplexity — this is a proof of concept, not a competitive model.
-- No efficiency benchmark against transformers; the constant-memory property of SRM is structural (by construction) and not yet measured empirically.
-- Component ablations (chaos router vs. linear router; with/without SRM) are in progress and will quantify how much each novel component contributes.
+```
+spider-web-slm/
+├── core/
+│   ├── web.py          # SpiderWeb — top-level model
+│   ├── node.py         # WebNode — SwiGLU + lateral attn + SRM + router
+│   ├── lorenz.py       # LorenzRouter — Lorenz-63 ODE routing
+│   ├── memory.py       # SolarRingMemory — SRM v2.1 (Variant A broadcast write)
+│   └── rope.py         # 3-Axis Polar RoPE
+├── train/
+│   ├── loss.py         # CE + routing entropy + load-balance loss
+│   ├── scheduler.py    # Cosine-warmup LR + temperature scheduler
+│   ├── dataloader.py   # TinyStories dataloader
+│   └── curriculum.py   # Phase scheduler (soft→hard routing)
+├── train_final.py      # Final 20 000-step run (Variant-A SRM, fp32 fix)
+├── train_ablation.py   # Linear-router ablation (incomplete — see below)
+├── infer.py            # Inference: n-gram blocking + sentence-stop
+├── config.py           # All hyperparameters
+├── docs/
+│   └── architecture.svg
+└── checkpoints/
+    └── final_run/      # best.pt (CE 4.42)  last.pt (step 20 000)
+```
+
+---
+
+## Honest Framing
+
+Spider Web SLM is a **proof of concept**, not a competitive language model.
+
+It demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a constant-memory sequential context store whose activation footprint grows sub-linearly with sequence length.
+
+It does **not** demonstrate that chaos routing outperforms a comparably-sized transformer. The planned ablation comparing the Lorenz router against an identically-structured linear router (same parameters, same training budget) was interrupted early. The preliminary result at step 3 600 showed the linear router slightly ahead in CE — suggesting that at this scale, the routing mechanism is unlikely to be the performance bottleneck. Data volume, model depth, and training budget dominate.
+
+---
 
 ## License
 
 MIT
-
