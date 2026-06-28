@@ -144,7 +144,70 @@ Probed with inference tests (temp=0.6, top_k=30, ngram=3, stop_at_sentence).
 
 Within a single sentence the model shows solid syntactic and lexical associations — the right grammatical slot is filled, frequent collocations are predicted confidently, and surface patterns like dialogue punctuation are well-learned.
 
-As expected for a 3.48 M-parameter model trained on TinyStories, capabilities requiring cross-sentence binding — coreference, numeric state tracking, causal inference, and relational reasoning — are out of range. These reflect model scale and training corpus, not the routing architecture specifically.
+Capabilities requiring **cross-sentence binding** — coreference, attribute recall, numeric state tracking, relational reasoning — are out of range. We initially attributed this to model scale and corpus. A focused investigation (next section) overturned that: the failure is **architectural**, not a matter of scale or training budget. From a language-competent baseline, with dependency-rich data, the binding wall persists, and probes localize the cause to a missing primitive the architecture cannot supply.
+
+---
+
+## The Binding Investigation
+
+The central research finding of this project is not the model's loss but a precise account of **why it cannot bind** — remember an entity introduced earlier ("Lily had a red **ball**") and re-emit it at a later recall site ("She threw the ___" → **ball**). Binding underpins coreference, attribute recall, and state tracking.
+
+### Binding as a four-link chain
+
+A break anywhere yields total failure, so we decompose binding into four causal links and isolate each with a linear probe:
+
+1. **WRITE** — store the entity's identity when introduced.
+2. **SURVIVE** — carry it intact across intervening positions to the recall site.
+3. **RETRIEVE / COPY** — at the recall site, copy the *specific* stored entity, not an average of context.
+4. **DECODE / EMIT** — turn the retrieved identity into the correct output token.
+
+Every memory/retrieval mechanism we tried repaired at most one link; the chain stayed broken (**0/4**) until it was supervised end-to-end. The decisive metric throughout is **not CE** (near-neutral across arms) but a binding probe (is the specific entity in top-5?) and a frozen linear probe (is the entity linearly recoverable at the recall site; 4-way, chance 25%).
+
+### Per-arm localization (each arm, one link)
+
+All arms warm-start from the competent CE-4.42 baseline (step-0 CE ≈ 5.2 confirms it loaded), share seed and data order, and differ by exactly one mechanism.
+
+| Arm | What it fixes | Binding result |
+|-----|---------------|----------------|
+| Baseline substrate | — | Link 2 broken: ring-mean mixing + per-hop RMSNorm scrub identity; entity never survives |
+| Fixed-lag recall aux | link 1/3 | Loss trains 1.0 → 0.76 internally, but A/B null; both arms emit a *generic* noun ("car") |
+| Orbital query-read | link 3 | CE A 4.022 ≈ B 4.025; no binding. Learned bias favored **outer/transient** rings; store was mean-pooled over time |
+| Position-resolved struct read | link 3 hardware | Causal read, lookback 0.96–0.99 — retrieval *hardware* now exists; CE neutral |
+| Gated hybrid lookback | link 3 | Gate **learnable** (on-rate 15.8% → 91.4%), but binding **0/4**; linear probe at **chance every layer** (~24%) |
+| Substrate fixes (un-detach, residual, sharp head) | links 1/2 | Big CE win 3.90 → 2.93, probe trajectory now monotonic (26→31%) but still barely above chance |
+
+### The retrieval-supervision fix (chain repaired, in-distribution)
+
+Probes pinned the live break at **retrieval**: the query-key never learns to point at the source. Supervising it directly (auxiliary NLL pulling recall→source attention, `w_attn=0.5`) repairs the chain — for the *trained* vocabulary:
+
+- attention-to-source mass: **ON 0.971** vs **OFF 0.067** (the original ~4% pathology);
+- recall-site linear probe: **ON 90.0%** vs **OFF 26.7%** (chance 25%);
+- full-budget generation, gold entity not in the visible suffix (n=120, chance top-5 ≈ 0.1%):
+
+| Test | top-1 | top-5 | median rank |
+|------|------:|------:|------------:|
+| In-template (trained templates + vocab) | 15% | **60%** | 4 |
+| Novel sentence structure (trained vocab) | 5% | 22% | 15 |
+| **Unseen entity types** (never bound in training) | **0%** | **0%** | 462 |
+
+In-template binding **decodes for the first time** (60% top-5 vs 0/4 for every prior arm) — but completely fails to generalize to unseen entity types.
+
+### COPY generalizes, EMIT structurally cannot
+
+A wide-vocabulary study (**197 training nouns vs 49 held-out, zero overlap**) decomposes binding into two halves with opposite fates:
+
+- **ROUTING / COPY generalizes** — held-out attention-to-source mass **0.23 → 0.83**, source = argmax **24% → 87%**. The query-key learned a general, token-agnostic "copy the introduced noun" rule that fires on unseen nouns.
+- **EMIT / READOUT does not** — held-out identity is barely recoverable even by an ideal *tied* head (embedding-similarity rank 132/246 ≈ chance), and the **untied** LM head ranks held-out nouns near the **bottom** (emit rank 222/246; two-alternative forced choice **15.8%**, *below* 50%).
+
+The asymmetry is structural. Routing is **one relational rule** that fires regardless of which token it is, so it generalizes. EMIT needs **each token's own output coordinate** in `lm_head`, shaped by gradient only when that token is seen as a *target* — there is no general rule and no structural bridge from "the identity that was copied" to "the row of `lm_head` that emits it." Unseen tokens cannot be emitted regardless of vocabulary size.
+
+### Root cause and the structural fix
+
+The Spider Web substrate has **no content-agnostic, identity-preserving COPY primitive** — the one operation attention provides natively and binding fundamentally requires. Every substrate operator (chaos routing, ring-mean lateral mixing, gated memory blend, per-hop RMSNorm, time mean-pool) is a **mixing / averaging / smoothing** operator that destroys the per-token identity binding must preserve and relocate.
+
+> **Binding = a COPY step (routing) that generalizes + an EMIT step (identity readout) that does not.** An averaging substrate with an untied linear readout can be taught to *route* generally, but cannot be taught to *emit* generally.
+
+The fix is structural, not more data: a **pointer/copy readout** — output `P(token) ∝ similarity(token_embedding, copied_source_representation)`, emitting *the thing that was copied* and bypassing the learned value/output transforms and the untied head — together with **tying `lm_head` to the embedding**. This is a hypothesis motivated by the decomposition; it has **not** yet been implemented or measured.
 
 ---
 
@@ -233,7 +296,9 @@ Community reimplementations of TinyStories at comparable parameter counts, but w
 
 Spider Web SLM is a **proof of concept and a work in progress**, not a competitive language model. It is being actively developed with the goal of improving its capabilities over time.
 
-In its current state it demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a fixed-size sequential context store. The fair parameter-matched scaling test (above) shows that SRM's theoretical O(1) memory advantage does not yet translate into a practical advantage at the tested sequence lengths — both architectures grow at similar rates up to 2048 tokens. A real advantage would require much longer contexts than those tested, and would need to be weighed against the 65–149× throughput deficit from the serial hop loop.
+In its current state it demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a fixed-size sequential context store. Its main *research* contribution is the binding investigation above: by building the non-attention alternative and instrumenting exactly where it breaks, it gives a constructive, measured account of what attention supplies natively — a content-agnostic, identity-preserving copy at both the routing and the output stage — that an averaging-based substrate structurally lacks.
+
+The fair parameter-matched scaling test (above) shows that SRM's theoretical O(1) memory advantage does not yet translate into a practical advantage at the tested sequence lengths — both architectures grow at similar rates up to 2048 tokens. A real advantage would require much longer contexts than those tested, and would need to be weighed against the 65–149× throughput deficit from the serial hop loop.
 
 It does not yet demonstrate that chaos routing outperforms a comparably-sized transformer. The planned ablation comparing the Lorenz router against an identically-structured linear router (same parameters, same training budget) was interrupted early. The preliminary result at step 3,600 showed the linear router slightly ahead in cross-entropy — suggesting that at this scale the routing mechanism is unlikely to be the performance bottleneck, and that data volume, model depth, and training budget dominate. Closing that question with a full-budget ablation is part of ongoing work.
 
