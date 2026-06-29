@@ -144,7 +144,7 @@ Probed with inference tests (temp=0.6, top_k=30, ngram=3, stop_at_sentence).
 
 Within a single sentence the model shows solid syntactic and lexical associations — the right grammatical slot is filled, frequent collocations are predicted confidently, and surface patterns like dialogue punctuation are well-learned.
 
-Capabilities requiring **cross-sentence binding** — coreference, attribute recall, numeric state tracking, relational reasoning — are out of range. We initially attributed this to model scale and corpus. A focused investigation (next section) overturned that: the failure is **architectural**, not a matter of scale or training budget. From a language-competent baseline, with dependency-rich data, the binding wall persists, and probes localize the cause to a missing primitive the architecture cannot supply.
+Capabilities requiring **cross-sentence binding** — coreference, attribute recall, numeric state tracking, relational reasoning — were out of range in the base model. We initially attributed this to model scale and corpus. A focused investigation (next section) overturned that: the failure is **architectural**, not a matter of scale or training budget — probes localize it to a missing primitive (a content-agnostic, identity-preserving copy) the averaging substrate could not supply. That investigation then **supplied the primitive**: a pointer/copy readout, integrated with the language model, recovers generalizing binding (89% top-5 emit on entities never bound in training) **while keeping CE healthy (3.6)** — the substrate now binds *and* models language at once.
 
 ---
 
@@ -207,7 +207,43 @@ The Spider Web substrate has **no content-agnostic, identity-preserving COPY pri
 
 > **Binding = a COPY step (routing) that generalizes + an EMIT step (identity readout) that does not.** An averaging substrate with an untied linear readout can be taught to *route* generally, but cannot be taught to *emit* generally.
 
-The fix is structural, not more data: a **pointer/copy readout** — output `P(token) ∝ similarity(token_embedding, copied_source_representation)`, emitting *the thing that was copied* and bypassing the learned value/output transforms and the untied head — together with **tying `lm_head` to the embedding**. This is a hypothesis motivated by the decomposition; it has **not** yet been implemented or measured.
+The fix is structural, not more data: a **pointer/copy readout** — a copy branch that scatters the (already-general) recall→source attention straight into the vocabulary by source-token id, `P_copy[v] = Σ_u attn[u]·1[input_id[u]=v]`, emitting *the thing that was copied* with **zero per-token emit params** and bypassing the untied head entirely. A learned gate `λ` mixes it with a generative branch, and the loss is NLL on the mixture. This was implemented (`use_pointer`) and measured — see below.
+
+### The pointer/copy readout — measured (copy generalizes, but it cannibalizes language)
+
+Warm-started from the wide-vocab checkpoint with retrieval supervision on, 3000 steps, against a no-pointer control on identical data:
+
+| Metric (held-out / unseen nouns) | Pointer **OFF** (control) | Pointer **ON** |
+|---|---|---|
+| **top-5 emit (full vocab)** | **0.0%** | **94.2%** |
+| pool rank (mean, ↓ better) | 222.5 | 1.1 |
+| 2AFC (gold > random noun, chance 50%) | 14.2% | 100.0% |
+| **final EMA CE** (language-model quality) | **2.75** | **14.56** |
+
+The copy primitive **works**: unseen-entity emit jumps **0% → 94%**, confirming the decomposition — retrieval was never the bottleneck (both arms point at the source equally), only the readout was. But the gate **collapsed onto copy** (λ: 0.70 → 0.07), so the model became near-pure-copy and its general language ability **collapsed (CE 14.6)**. The cause is mechanical: the pointer's generative branch was tied to the raw `embed.weight` (an *untrained* output head, step-0 CE ≈ 17), so from the first step copy was the only branch reducing loss; the gate down-weighted generation, which then **starved it of gradient** (the gradient to the generative branch scales with λ) — a self-reinforcing mixture-of-experts collapse. This validated the *mechanism* but not an *integrated capability*: the model did one or the other depending on where λ landed.
+
+### Binding AND language together — the integration fix
+
+Four changes break the collapse, each flag-gated for clean A/B:
+
+- **A — don't cripple generation.** Warm-start the generative branch from the **trained `lm_head`** (not the untrained `embed.weight` tie), so generation is competent at step 0 (gen-CE ≈ 3.4, not ≈ 17) and the gate has no reason to abandon it. (`pointer_warm_gen`)
+- **B — no gradient starvation.** Affine-floor the generative weight `λ ∈ [0.2, 1]`, so the generative branch always receives gradient. (`pointer_lambda_floor=0.2`)
+- **C — supervise the gate as a router.** A BCE on `λ` using the synthetic `recall_pos`/`is_bind` labels: push `λ→0` (copy) **only** at the entity-recall token, `λ→1` (generate) everywhere else. (`w_router=1.0`)
+- **D — rebalance the mix.** Lower the binding fraction `p_bind 0.75 → 0.4` so general-LM gradient isn't drowned out.
+
+During training both designed signals fire: `λ@recall` falls to the 0.2 floor by step 250 and stays pinned (router routes copy at recall tokens), while `λ_mean` rises to ~0.99 (generation handles everything else); mixture-CE tracks generative-CE the whole way. Result, same held-out battery (n=120/group):
+
+| Metric | OFF (control) | Pointer ON (collapsed) | **Integrated (A+B+C+D)** |
+|---|---|---|---|
+| **final EMA CE** (LM quality) | 2.75 ✓ | **14.56** ✗ | **3.61** ✓ |
+| **held-out emit, top-5** | **0.0%** ✗ | 94.2% ✓ | **89.2%** ✓ |
+| held-out 2AFC (chance 50%) | 14.2% ✗ | 100% ✓ | **98.3%** ✓ |
+| held-out pool rank (↓) | 222.5 ✗ | 1.1 ✓ | **7.0** ✓ |
+| trained-noun emit, top-5 | 3.3% | 100% | 99.2% |
+
+This is the first arm where **both hold at once**: healthy language modeling (CE 3.6, near the 2.75 control and 4× better than the collapsed arm) **and** generalizing binding (89% top-5 / 98% 2AFC emit on entities never bound in training). The router confines copy to entity-recall tokens while the warm generative head carries ordinary language — the substrate now has the content-agnostic copy primitive it structurally lacked, integrated with the language model rather than replacing it. The small gap vs the pure-copy arm (89% vs 94% emit, rank 7 vs 1) is the expected cost of the λ floor capping copy weight at 0.8 — a worthwhile trade for recovering ~11 points of CE.
+
+> **Reproduce:** `python train_wide_vocab.py --use_pointer --warm_gen --lambda_floor 0.2 --w_router 1.0 --p_bind 0.4 --base checkpoints/wide_vocab/best.pt --w_attn 0.5 --steps 3000 --out checkpoints/integrated` then `python probe_wide_eval.py checkpoints/integrated/best.pt 120`.
 
 ---
 
@@ -296,7 +332,7 @@ Community reimplementations of TinyStories at comparable parameter counts, but w
 
 Spider Web SLM is a **proof of concept and a work in progress**, not a competitive language model. It is being actively developed with the goal of improving its capabilities over time.
 
-In its current state it demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a fixed-size sequential context store. Its main *research* contribution is the binding investigation above: by building the non-attention alternative and instrumenting exactly where it breaks, it gives a constructive, measured account of what attention supplies natively — a content-agnostic, identity-preserving copy at both the routing and the output stage — that an averaging-based substrate structurally lacks.
+In its current state it demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a fixed-size sequential context store. Its main *research* contribution is the binding investigation above: by building the non-attention alternative and instrumenting exactly where it breaks, it gives a constructive, measured account of what attention supplies natively — a content-agnostic, identity-preserving copy at both the routing and the output stage — that an averaging-based substrate structurally lacks, and then **closes the loop** by adding that primitive back as a pointer/copy readout and showing, with a held-out battery, that the repaired substrate binds (89% top-5 emit on unseen entities) *and* models language (CE 3.6) simultaneously. The next step is to show this integrated binding supports downstream *reasoning* (multi-hop attribute recall, state tracking), not just single-entity re-emission.
 
 The fair parameter-matched scaling test (above) shows that SRM's theoretical O(1) memory advantage does not yet translate into a practical advantage at the tested sequence lengths — both architectures grow at similar rates up to 2048 tokens. A real advantage would require much longer contexts than those tested, and would need to be weighed against the 65–149× throughput deficit from the serial hop loop.
 
