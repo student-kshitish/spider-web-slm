@@ -74,6 +74,37 @@ REPEAT_WINDOW  = 32
 # tau used at inference — matches the final annealed value from training
 INFER_TAU = 0.1
 
+# Sentence-ending token ids are resolved lazily at first call.
+_SENT_END_IDS: list[int] | None = None
+
+def _sent_end_ids(sp: spm.SentencePieceProcessor) -> list[int]:
+    """Return token ids whose decoded surface form ends with . ! or ?"""
+    global _SENT_END_IDS
+    if _SENT_END_IDS is None:
+        ends = set()
+        for i in range(sp.GetPieceSize()):
+            piece = sp.IdToPiece(i)
+            if any(piece.endswith(c) for c in (".", "!", "?")):
+                ends.add(i)
+        _SENT_END_IDS = list(ends)
+    return _SENT_END_IDS
+
+
+def _block_ngrams(logits: torch.Tensor, generated: list[int], n: int) -> torch.Tensor:
+    """Set logits to -inf for any token that would complete a repeated n-gram."""
+    if n <= 0 or len(generated) < n - 1:
+        return logits
+    suffix = generated[-(n - 1):]          # last (n-1) tokens
+    banned: set[int] = set()
+    for start in range(len(generated) - (n - 1)):
+        if generated[start : start + n - 1] == suffix:
+            banned.add(generated[start + n - 1])
+    if banned:
+        logits = logits.clone()
+        for tok in banned:
+            logits[tok] = float("-inf")
+    return logits
+
 
 def generate(
     model: SpiderWeb,
@@ -85,6 +116,10 @@ def generate(
     top_p: float,
     seq_len: int,
     device: torch.device,
+    # --- new parameters ---
+    no_repeat_ngram_size: int = 0,
+    stop_at_sentence: bool = False,
+    min_new_tokens: int = 10,
 ) -> str:
 
     model.eval()
@@ -93,20 +128,19 @@ def generate(
     if not prompt_ids:
         prompt_ids = [sp.bos_id() if sp.bos_id() >= 0 else 1]
 
-    ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)  # (1, T_prompt)
+    ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     generated_ids: list[int] = []
+
+    sent_ends = _sent_end_ids(sp) if stop_at_sentence else []
 
     with torch.no_grad():
         for _ in range(max_new_tokens):
 
-            # truncate from the left to stay within seq_len
             context = ids[:, -seq_len:] if ids.size(1) > seq_len else ids
+            out     = model(context, tau=INFER_TAU, hard=True)
+            logits  = out["logits"][0, -1, :]
 
-            out = model(context, tau=INFER_TAU, hard=True)
-
-            logits = out["logits"][0, -1, :]  # (vocab_size,)
-
-            # repetition penalty over the recent window
+            # repetition penalty over recent window
             recent_tokens = ids[0, -REPEAT_WINDOW:].tolist()
             for tok in set(recent_tokens):
                 if logits[tok] > 0:
@@ -114,14 +148,20 @@ def generate(
                 else:
                     logits[tok] = logits[tok] * REPEAT_PENALTY
 
+            # no-repeat-ngram blocking
+            if no_repeat_ngram_size > 0:
+                logits = _block_ngrams(logits, generated_ids, no_repeat_ngram_size)
+
             next_tok = sample_token(logits, temperature, top_k, top_p)
 
             generated_ids.append(next_tok)
+            ids = torch.cat([ids, torch.tensor([[next_tok]], device=device)], dim=1)
 
-            next_tensor = torch.tensor([[next_tok]], dtype=torch.long, device=device)
-            ids = torch.cat([ids, next_tensor], dim=1)
+            # sentence-boundary stop: halt after min_new_tokens at a sentence end
+            if stop_at_sentence and len(generated_ids) >= min_new_tokens:
+                if next_tok in sent_ends:
+                    break
 
-    # Decode prompt + continuation together so SentencePiece handles spacing
     return sp.DecodeIds(prompt_ids + generated_ids)
 
 
@@ -132,11 +172,14 @@ def generate(
 def main():
     parser = argparse.ArgumentParser(description="Spider Web SLM — Inference")
     parser.add_argument("--prompt",         type=str,   default="Once upon a time")
-    parser.add_argument("--max_new_tokens", type=int,   default=100)
-    parser.add_argument("--temperature",    type=float, default=0.8)
-    parser.add_argument("--top_k",          type=int,   default=40)
-    parser.add_argument("--top_p",          type=float, default=0.9)
-    parser.add_argument("--checkpoint",     type=str,   default="checkpoints/best.pt")
+    parser.add_argument("--max_new_tokens",       type=int,   default=100)
+    parser.add_argument("--temperature",          type=float, default=0.6)
+    parser.add_argument("--top_k",                type=int,   default=30)
+    parser.add_argument("--top_p",                type=float, default=1.0)
+    parser.add_argument("--no_repeat_ngram_size", type=int,   default=3)
+    parser.add_argument("--stop_at_sentence",     action="store_true", default=False)
+    parser.add_argument("--min_new_tokens",       type=int,   default=10)
+    parser.add_argument("--checkpoint",           type=str,   default="checkpoints/best.pt")
     args = parser.parse_args()
 
     cfg    = get_config()
@@ -163,15 +206,18 @@ def main():
           f"top_k={args.top_k}  top_p={args.top_p}\n")
 
     output = generate(
-        model        = model,
-        sp           = sp,
-        prompt       = args.prompt,
-        max_new_tokens = args.max_new_tokens,
-        temperature  = args.temperature,
-        top_k        = args.top_k,
-        top_p        = args.top_p,
-        seq_len      = cfg.model.max_seq_len,
-        device       = device,
+        model                = model,
+        sp                   = sp,
+        prompt               = args.prompt,
+        max_new_tokens       = args.max_new_tokens,
+        temperature          = args.temperature,
+        top_k                = args.top_k,
+        top_p                = args.top_p,
+        seq_len              = cfg.model.max_seq_len,
+        device               = device,
+        no_repeat_ngram_size = args.no_repeat_ngram_size,
+        stop_at_sentence     = args.stop_at_sentence,
+        min_new_tokens       = args.min_new_tokens,
     )
 
     print("--- Generated ---")

@@ -1,0 +1,153 @@
+BINDING PROBE — NOTES
+=====================
+
+Goal
+----
+Test whether the inner-ring depth+recall mechanism actually improves
+cross-sentence binding (remembering an earlier entity to predict a later
+token) before committing to a multi-day full run.
+
+Step 1 — dependency-rich dataset (done)
+---------------------------------------
+Built data/raw/binding.txt (30 MB, 310k stories) alongside TinyStories.
+Each story introduces NAME + ATTR + OBJECT, then filler sentences that never
+mention them, then a recall sentence. The recalled word is predictable ONLY
+from the earlier mention, not from local context — so it genuinely forces
+binding. Distance varied via 1-3 filler sentences.
+
+Step 2 — from-scratch run (done, but INVALID as a binding test)
+---------------------------------------------------------------
+Trained fresh-from-step-0 on a 50/50 binding+TinyStories mix.
+batch=64, seq_len=256, lr=2e-4, w_depth=0.005, w_recall=0.02, 2500 steps.
+Checkpoint: checkpoints/binding_run/best.pt
+
+Result: the model was UNDERTRAINED.
+  - final CE = 6.84  (perplexity ~934)   vs baseline final_run CE 4.42 (ppl ~83)
+  - the baseline had 20,000 steps; this run had 2,500 from scratch on a slow,
+    python-loop-bound architecture — nowhere near language competence.
+  - in-distribution diagnostic: on EXACT training-format prompts, after
+    "the red ___" the model predicts '.', 'a', 'the' at ~0.01 probability.
+    It has not even learned the LOCAL rule that an adjective is followed by a
+    noun, let alone cross-sentence binding.
+
+Conclusion on Step 2: the binding test was INCONCLUSIVE due to undertraining.
+This is NOT evidence of a capacity wall. The model simply had not learned
+language yet, so binding could not be assessed either way. Any "capacity
+wall" claim is unsupported by this data.
+
+Planning miss: the run was sized by matching token VOLUME (~160k sequences),
+but the baseline reached CE 4.42 via 20k steps of effective training. Matching
+volume did not match competence. Binding is only testable on a
+language-competent model.
+
+Step 3 — corrected decisive test: fine-tune-from-baseline A/B
+------------------------------------------------------------
+Start BOTH arms from checkpoints/final_run/best.pt (the CE 4.42 model that
+already knows English), so any binding gain is cleanly attributable to the
+mechanism rather than to relearning language.
+
+  Common: 50/50 binding+TinyStories mix, seq_len=256, lr=1e-4 (fine-tune),
+          ~2000 steps, identical seed/data order, batch as large as fits.
+  Arm A (mechanism ON) : w_depth=0.005, w_recall=0.02 -> checkpoints/binding_ft_on/
+  Arm B (control, OFF) : w_depth=0.0,   w_recall=0.0  -> checkpoints/binding_ft_off/
+
+Both must start warm: step-0 CE ~4.4 (NOT 8.5) proves the competent baseline
+loaded. Decisive question: does Arm A put the recalled entity (ball/hat/blue)
+in top-5 where Arm B does not? If yes -> mechanism improves binding. If both
+behave identically -> mechanism does not help binding even with dependency-rich
+data. Either outcome is a real answer.
+
+Step 3 RESULTS — fine-tune-from-baseline A/B (done, VALID)
+---------------------------------------------------------
+Both arms started from final_run/best.pt, batch=48, slots=32, seq_len=256,
+lr=1e-4, 2000 steps, identical seed/data order (ran in parallel).
+
+Warm-start confirmed: step-0 CE = 5.219 for BOTH arms (NOT 8.5) -> competent
+baseline loaded. Identical step-0 confirms identical data order across arms.
+
+Training curves (EMA-CE / recall):
+  Arm A (ON) : CE 5.219 -> best 4.169 | recall 1.016 -> ~0.76 (recall_proj
+               learned), depth pressure active (~ -18 to -22)
+  Arm B (OFF): CE 5.219 -> best 4.106 | recall stays ~1.02 (untrained, as
+               expected), depth ~0
+  Both competent (CE ~4.1); ON pays a tiny CE cost for the aux losses.
+
+Probe results (top-5 next token):
+  "Lily had a red ball. She threw the"
+     A:ON  -> park, sky, tree, sun, little      (ball/red ABSENT)
+     B:OFF -> park, sky, tree, sun, hill        (ball/red ABSENT)
+  "Sara had a blue hat. Later, Sara wore the"
+     A:ON  -> park, tree, sky, sun, little      (hat/blue ABSENT)
+     B:OFF -> park, sky, tree, sun, little      (hat/blue ABSENT)
+  Competence check "...Then Lily threw the red ___" (a NOUN should follow):
+     A:ON  -> and, park, tree, sky, CAR   (predicts a noun -> competent)
+     B:OFF -> and, '.', CAR, old, BALL    (predicts a noun -> competent)
+
+VERDICT (clean): the depth+recall mechanism does NOT improve cross-sentence
+binding. Arm A behaves essentially identically to Arm B. Both are competent
+(they predict a generic noun after "the red ___"), but neither retrieves the
+SPECIFIC earlier entity ("ball"/"hat") — they emit a plausible generic noun
+("car") instead. The control (B) rules out undertraining as the cause: from a
+competent start, with dependency-rich data, the mechanism adds no binding.
+
+Interpretation: the recall loss trained fine internally (1.0 -> 0.76) but it
+optimises a FIXED-LAG (lag=4) embedding reconstruction into inner-ring memory,
+which is not the same as content-addressable, variable-distance entity
+retrieval. That likely explains why "recall_loss went down" did not translate
+into actual entity binding at the output.
+
+This is a real negative result for THIS mechanism at THIS scale/budget — it is
+NOT a general "capacity wall" claim. A genuine binding capability would likely
+need a different memory-read mechanism (query-by-content over stored entities),
+not a fixed-lag reconstruction auxiliary.
+
+
+Step 4 — orbital QUERY-READ A/B (content-addressable retrieval), done
+--------------------------------------------------------------------
+Replaced the fixed-lag recall loss with a learned content-addressable read:
+query from hidden state -> scaled dot-product vs ALL memory slots (all rings)
+-> + learnable per-ring bias -> softmax ("orbital" cloud) -> prob-weighted slot
+sum -> gated fuse into hidden before the LM head. Toggle: use_query_read.
+Code: core/memory.py (OrbitalQueryRead), core/web.py (integration), config flag.
+
+A/B from final_run/best.pt, batch=48, seq_len=256, lr=1e-4, 2500 steps, same
+seed/data, CE-only loss (NO fixed-lag recall for either arm).
+  Arm A (read ON) -> checkpoints/query_on   Arm B (read OFF) -> checkpoints/query_off
+
+Curves (EMA-CE), both warm from ~5.21:
+  step    500   1000   1500   2000   2499   best
+  A:ON   4.494  4.219  4.140  4.048  4.022  3.975
+  B:OFF  4.496  4.232  4.163  4.065  4.025  3.988
+  -> essentially identical; the read gives no CE benefit. (These are the
+     best-trained binding models so far, lower CE than the Step-3 fixed-lag run.)
+
+Binding probes (specific earlier entity in top-5?):
+  "Lily had a red ball. She threw the"        A:ON absent | B:OFF 'ball' (rank5, 0.012)
+  "Sara had a blue hat. Later, Sara wore the" A:ON absent | B:OFF absent
+  "Ben found a small key. Ben used the"       A:ON absent | B:OFF absent
+  Competence "...the red ___": both predict a noun ('car') -> both competent.
+  Note: B:OFF's single 'ball' hit is rank-5 near noise and it also surfaces
+  'ball' for the KEY story (wrong entity) -> it's frequency, not real binding.
+
+Learned per-ring bias (Arm A), init 0:
+  ring0 [inner] -0.047   ring1 [inner] -0.028
+  ring2 [outer] +0.028   ring3 [outer] +0.057
+  realized mass: [0.152, 0.220, 0.267, 0.361]
+  -> FAVORS OUTER rings (inner-sum -0.075 vs outer-sum +0.085). This is the
+     OPPOSITE of the orbital depth-weighting hypothesis: the model preferred
+     transient outer-ring slots over persistent inner-ring slots.
+
+VERDICT (clean): the content-addressable orbital read does NOT produce
+cross-sentence binding at this scale/budget. Arm A is no better than (and on
+the one near-noise hit, slightly worse / more generic than) the control. The
+depth-weighting it learned favors outer/transient rings, not inner/persistent
+ones.
+
+Likely structural cause: in core/web.py the per-node memory is mean-pooled over
+the time dimension before storage (m_t_new = ...reshape(B,T,slots,d).mean(1)).
+The read therefore queries a time-AVERAGED bag of content, which cannot isolate
+"the ball mentioned at position k". Content-addressable retrieval can't bind
+when the store it reads from has already collapsed the time axis. A real fix
+would keep position-resolved memory (or write distinct entities to distinct
+slots) BEFORE adding a query read.
+

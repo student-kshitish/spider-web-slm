@@ -1,0 +1,70 @@
+RESUME — DIRECTION-GATED STRUCTURAL RETRIEVAL A/B
+=================================================
+Stopped 2026-06-25 (day 1). Resume tomorrow.
+
+What this experiment is
+-----------------------
+Clean A/B testing whether a STRUCTURAL (direction-gated) retrieval constraint
+helps or hurts cross-sentence binding, on top of the position-resolved memory
+fix. Both arms use the new StructuralOrbitalRead (core/memory.py), wired in
+core/web.py after the hop loop, toggled by config use_struct_read/struct_mask.
+
+  Arm A (struct_on)  : inward structural mask ON  (struct_mask=True)
+                       a query at ring r may read only positions whose ring is
+                       inward-or-equal (ring[s] <= ring[t]), plus causal s<=t.
+  Arm B (struct_off) : FLAT causal read           (struct_mask=False)
+                       any causal position s<=t, no ring restriction.
+  They differ ONLY by the structural mask.
+
+KEY FIX (vs the failed query-read run): memory is now POSITION-RESOLVED. The
+read's bank is the per-position hidden states (full T=256, NO mean-pool over
+time), so retrieval can reach a SPECIFIC earlier entity. This solves the
+time-collapse bug that made the previous slot-read unable to bind. Confirmed
+working: lookback ~0.96-0.99 (most attention mass goes to past positions, not
+self). The read is causal (verified: zero attention mass above the diagonal).
+
+Start point
+-----------
+Both arms warm-started from checkpoints/final_run/best.pt (the competent CE 4.42
+baseline). Step-0 CE = 5.283 for both (warm, not 8.5).
+
+Stopped at
+----------
+Both arms were at step ~1000 of 2500 when SIGINT'd (last logged line: step 1000,
+CE: A=4.198/EMA 4.224, B=4.163/EMA 4.210). Both descending ~identically
+(EMA ~4.43 at step 500, ~4.21 at step 1000) — the structural mask is roughly
+neutral on CE so far.
+
+  IMPORTANT: the CE curve is NOT the decisive metric. The decisive test is the
+  BINDING PROBE (run test_struct_ab.py) AFTER training completes — i.e. does
+  either arm retrieve the specific earlier entity (ball/hat/key), and does the
+  mask help/hurt/match flat. Do not conclude anything from CE alone.
+
+Checkpoints to resume from
+--------------------------
+  checkpoints/struct_on/last.pt   (Arm A, struct_mask=True)
+  checkpoints/struct_off/last.pt  (Arm B, struct_mask=False)
+
+  *** CAVEAT — read before resuming ***
+  These last.pt files are COPIES of best.pt and contain MODEL WEIGHTS ONLY.
+  The training script (train_struct_ab.py) saved neither optimizer nor
+  scheduler state, and SIGINT had no save handler, so a true exact resume is
+  NOT possible. Resuming = WARM RESTART: load these weights as the starting
+  point, re-create a fresh AdamW + cosine/temperature schedulers, and continue.
+  Given only ~1000/2500 steps were done and Adam re-warms quickly, the loss
+  is small — but it is a restart-from-weights, not an optimizer-state resume.
+
+  best.pt step numbers (latest EMA-best saved): struct_on=973, struct_off=916.
+
+How to resume tomorrow
+----------------------
+train_struct_ab.py currently always starts from final_run/best.pt. To resume
+from day-1 weights instead, point BASE_CKPT at the struct_*/last.pt for each arm
+(or add a --resume flag). Keep STEPS=2500 (or reduce to remaining ~1500), same
+config: dim=64, hidden_dim=256, slots=32, seq_len=256, lr=1e-4, use_struct_read
+=True, struct_mask per arm. Then run test_struct_ab.py for the decisive probes.
+
+Logs backed up
+--------------
+  logs/struct_on_day1.log, logs/struct_off_day1.log  (so resume-append won't
+  clobber day-1 curves).

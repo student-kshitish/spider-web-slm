@@ -1,0 +1,38 @@
+RING HIERARCHY PROBE — NOTES
+============================
+
+Finding: structural bug in radial routing
+-----------------------------------------
+Ring 0 (the innermost ring) was unreachable by construction. The exit
+condition included `(cr == 0)`, so any token that reached ring 0 was
+immediately forced to exit before it could be used. Ring 0 was dead:
+0 visits across all runs.
+
+Fix (core/web.py)
+-----------------
+Removed the `| (cr == 0)` term from the exit condition. Exit now happens
+only on an explicit exit decision (action 2). Inward movement is already
+guarded by `cr > 0`, so ring 0 is now a reachable, usable terminal ring.
+
+Depth + recall mechanism (train/loss.py)
+----------------------------------------
+Added two auxiliary radial-hierarchy losses:
+  (a) depth pressure  — outer rings pay for choosing exit over move_in,
+                        pushing tokens deeper into the web.
+  (b) inner-ring recall — inner-ring memory must reconstruct the lagged
+                        token embedding.
+
+Effect:
+  - inner-ring usage: 20% -> 58%
+  - recall loss:      1.00 -> 0.80
+
+Tuning for the full run
+-----------------------
+  w_depth  = 0.005
+  w_recall = 0.02
+
+Cost / trade-off
+----------------
+CE traded up to ~7.25 at 2000 steps due to the auxiliary losses.
+
+Status: both code changes persisted on disk (verified). No run active.

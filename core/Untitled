@@ -1,0 +1,92 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils.parametrizations import spectral_norm
+
+class SolarRingMemory(nn.Module):
+    """
+    SRM v2.1 — The Definitive Reasoning Engine.
+    Features:
+      - Temporal Slots (M_t): Persist across the sequence for entity tracking.
+      - Spatial Flow (M_s): Passes compressed summaries inward toward the nucleus.
+      - Gravitational Attention: Tokens 'pull' info from slots based on similarity.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.d = config.model.dim
+        self.slots = config.memory.slots
+        self.alpha = config.memory.alpha  # Retention factor
+        self.beta = config.memory.beta    # Update strength
+
+        # 1. Learned Initial Seeds
+        # This prevents the memory from starting as 'noise' at the beginning of a sentence.
+        self.m_t_seed = nn.Parameter(torch.randn(self.slots, self.d) * 0.02)
+        self.m_s_seed = nn.Parameter(torch.randn(self.slots, self.d) * 0.02)
+
+        # 2. Gravitational Projections (Spectral Normalized)
+        # Using Spectral Norm ensures the 'gravity' constant stays stable during training.
+        self.q_proj = spectral_norm(nn.Linear(self.d, self.d, bias=False))
+        self.k_proj = spectral_norm(nn.Linear(self.d, self.d, bias=False))
+
+        # 3. Gating & Compression
+        self.read_gate = spectral_norm(nn.Linear(self.d, self.d, bias=False))
+        self.spatial_compress = spectral_norm(nn.Linear(self.d, self.d, bias=False))
+
+        # 4. Normalization
+        # RMSNorm is faster and more stable than LayerNorm for high-frequency SLM updates.
+        self.norm = nn.RMSNorm(self.d)
+
+    def init_memory(self, batch_size: int, device: torch.device):
+        """Initializes state for a new sequence."""
+        m_t = self.m_t_seed.unsqueeze(0).expand(batch_size, -1, -1).clone()
+        m_s = self.m_s_seed.unsqueeze(0).expand(batch_size, -1, -1).clone()
+        return m_t, m_s
+
+    def gravity_read(self, h: torch.Tensor, M: torch.Tensor):
+        """
+        Calculates the gravitational pull between hidden state 'h' and memory 'M'.
+        Returns:
+            context: (B, d) - The info pulled from memory.
+            weights: (B, slots) - The gravity distribution.
+        """
+        q = self.q_proj(h).unsqueeze(1)                   # (B, 1, d)
+        k = self.k_proj(M)                                 # (B, slots, d)
+        
+        # Calculate 'Gravitational Potential'
+        scores = (q @ k.transpose(-2, -1)) / (self.d ** 0.5)
+        weights = F.softmax(scores, dim=-1)                # (B, 1, slots)
+        
+        context = (weights @ M).squeeze(1)                # (B, d)
+        return context, weights.squeeze(1)
+
+    def forward(self, h, m_t_prev, m_s_above=None):
+        """
+        h: (B, d)
+        m_t_prev: (B, slots, d)
+        m_s_above: (B, slots, d) - Compressed spatial memory from outer ring
+        """
+        
+        # --- 1. SPATIAL UPDATE ---
+        # If we have info from an outer ring, compress and blend it.
+        if m_s_above is not None:
+            m_s_local = torch.tanh(self.spatial_compress(m_s_above))
+            ctx_s, _ = self.gravity_read(h, m_s_local)
+            h = h + 0.5 * ctx_s
+
+        # --- 2. TEMPORAL READ ---
+        # Pull context from the sequence-level memory.
+        ctx_t, g_weights = self.gravity_read(h, m_t_prev)
+
+        # --- 3. SCALED RESIDUAL UPDATE (The Heart of SRM) ---
+        # Decide what to inject into the slots
+        gate = torch.sigmoid(self.read_gate(h))
+        payload = (gate * ctx_t).unsqueeze(1) * g_weights.unsqueeze(-1)
+        
+        # M_new = alpha * M_old + beta * Gated_Payload
+        m_t_next = self.alpha * m_t_prev + self.beta * payload
+        m_t_next = self.norm(m_t_next)
+
+        # Output context is a mix of the gated state and the temporal context
+        h_out = h + 0.5 * ctx_t
+        
+        return h_out, m_t_next 

@@ -25,6 +25,13 @@ class WebNode(nn.Module):
         self.d = config.model.dim
         self.hidden_dim = config.model.hidden_dim
 
+        # Substrate fix (3): when sharp_head is set, the FFN + aux projections are
+        # left UNNORMALISED so the node can form high-gain (sharp) copy circuits.
+        # Safe for the chaos router because the FFN output is RMSNorm'd (ffn_norm)
+        # before the router sees it, and the router keeps its own spectral_norm.
+        sharp = getattr(config.model, "sharp_head", False)
+        sn = (lambda lin: lin) if sharp else spectral_norm
+
         # -------------------------
         # 1. LATERAL ATTENTION
         # -------------------------
@@ -36,9 +43,9 @@ class WebNode(nn.Module):
         # -------------------------
         # 2. SWIGLU FFN
         # -------------------------
-        self.w1 = spectral_norm(nn.Linear(self.d, self.hidden_dim, bias=False))
-        self.w2 = spectral_norm(nn.Linear(self.hidden_dim, self.d, bias=False))
-        self.w3 = spectral_norm(nn.Linear(self.d, self.hidden_dim, bias=False))
+        self.w1 = sn(nn.Linear(self.d, self.hidden_dim, bias=False))
+        self.w2 = sn(nn.Linear(self.hidden_dim, self.d, bias=False))
+        self.w3 = sn(nn.Linear(self.d, self.hidden_dim, bias=False))
         self.ffn_norm = nn.RMSNorm(self.d)
 
         # -------------------------
@@ -50,7 +57,7 @@ class WebNode(nn.Module):
         # -------------------------
         # 4. AUX PROJECTION (FIXED)
         # -------------------------
-        self.aux_proj = spectral_norm(
+        self.aux_proj = sn(
             nn.Linear(self.d, self.d, bias=False)
         )
 
