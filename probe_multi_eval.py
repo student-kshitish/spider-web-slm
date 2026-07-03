@@ -86,13 +86,20 @@ def name_pos_before(pieces, sp, nm, before):
 
 @torch.no_grad()
 def measure(model, device, sp, objs, seed, use_ptr, mem_copy, oracle=False,
-            k_fixed=None, name_transport=False):
+            k_fixed=None, name_transport=False, name_lookback=False):
     """k_fixed=None -> mixed k in {2,3} (the headline). k_fixed=K -> every prompt
     has exactly K simultaneous entities, for the k-sweep that exposes the S=32
-    modular-hash collision ceiling (distinct subjects approaching slot count)."""
+    modular-hash collision ceiling (distinct subjects approaching slot count).
+
+    name_lookback: the Step-2 learned name locator. name_src is NOT built or passed
+    (the whole point — located unaided at inference); instead we SCORE the lookback
+    attention's own name-localization: does a[obj_pos] argmax onto that clause's
+    subject name, and a[recall] onto the cue name? (labels used only for scoring)."""
     rng = random.Random(seed)
     cue1 = cue5 = rec1 = afc = 0
     m_cue = m_rec = 0.0
+    loc_obj_hit = loc_obj_tot = 0        # name-loc: object-intro -> clause subject
+    loc_rec_hit = 0                      # name-loc: recall -> cue name
     n = 0
     n_pool = len(TA.FEMALE) + len(TA.MALE)      # name pool (distinct subjects available)
     while n < N:
@@ -128,8 +135,29 @@ def measure(model, device, sp, objs, seed, use_ptr, mem_copy, oracle=False,
             if cpos is not None:
                 ns[0, len(ids) - 1] = cpos
             name_src = ns
+        if name_lookback:
+            # Step 2: the locator gets NO name positions — it must find them itself.
+            assert name_src is None, "name_src must be disabled for name_lookback at inference"
         out = model(inp, tau=0.1, hard=True, use_pointer=use_ptr, subj_id=subj_id,
                     name_src=name_src)
+        # NAME-LOCALIZATION (name_lookback only): score whether the lookback's own
+        # attention points at the governing name. Labels are used ONLY here for
+        # scoring — they never enter the forward above.
+        if name_lookback and out.get("name_stats") is not None:
+            a = out["name_stats"]["attn"][0].float()                 # (T,u)
+            for ob, nm in ent_pairs:
+                op = tok_pos(pieces, ob)                              # object-intro pos
+                if op is None:
+                    continue
+                tp = name_pos_before(pieces, sp, nm, op)             # its clause subject name
+                if tp is None:
+                    continue
+                loc_obj_tot += 1
+                loc_obj_hit += int(a[op].argmax().item() == tp)
+            rp = len(ids) - 1                                        # recall pos ("the")
+            cp = name_pos_before(pieces, sp, cue_name, rp)           # cue name
+            if cp is not None:
+                loc_rec_hit += int(a[rp].argmax().item() == cp)
         if use_ptr:
             Pv = out["pointer"]["P"][0, -1].float()
             logits = torch.log(Pv.clamp_min(1e-9))
@@ -149,8 +177,11 @@ def measure(model, device, sp, objs, seed, use_ptr, mem_copy, oracle=False,
             m_cue += row[cs].item(); m_rec += row[rs].item()
         n += 1
     if n == 0:
-        return (float("nan"),) * 6 + (0,)
-    return (cue1 / n, cue5 / n, rec1 / n, afc / n, m_cue / n, m_rec / n, n)
+        return (float("nan"),) * 8 + (0,)
+    loc_obj = (loc_obj_hit / loc_obj_tot) if loc_obj_tot else float("nan")
+    loc_rec = loc_rec_hit / n
+    return (cue1 / n, cue5 / n, rec1 / n, afc / n, m_cue / n, m_rec / n,
+            loc_obj, loc_rec, n)
 
 
 def main():
@@ -164,24 +195,33 @@ def main():
     mem_copy = bool(meta.get("mem_copy", False))
     oracle   = bool(meta.get("oracle_bind", False))
     ntrans   = bool(meta.get("name_transport", False))
+    nlook    = bool(meta.get("name_lookback", False))
     print(f"\n[multi-eval] ckpt={CKPT} ema_ce={ema} n={N}/group "
           f"use_pointer={use_ptr} mem_copy={mem_copy} oracle_bind={oracle} "
-          f"name_transport={ntrans}")
+          f"name_transport={ntrans} name_lookback={nlook}")
+    if nlook:
+        print("[multi-eval] name_lookback: name_src DISABLED at inference "
+              "(locator finds the name itself); reporting name-localization accuracy.")
     print(f"[multi-eval] single-tok nouns: train={len(train_objs)} "
           f"held-out={len(test_objs)} | cue=NON-recent, recency=distractor\n")
+    loc_hdr = f" | {'locObj':>7} {'locRec':>7}" if nlook else ""
     print(f"{'group':<16} {'cue-top1':>9} {'cue-top5':>9} {'recency1':>9} "
-          f"{'2AFC':>6} | {'readCue':>8} {'readRec':>8}")
-    print("-" * 74)
+          f"{'2AFC':>6} | {'readCue':>8} {'readRec':>8}{loc_hdr}")
+    print("-" * (74 + (18 if nlook else 0)))
     for tag, objs in [("TRAINED", train_objs), ("HELD-OUT", test_objs)]:
-        c1, c5, r1, afc, mc, mr, nn = measure(model, device, sp, objs, 0, use_ptr,
-                                              mem_copy, oracle=oracle,
-                                              name_transport=ntrans)
+        c1, c5, r1, afc, mc, mr, lo, lr, nn = measure(
+            model, device, sp, objs, 0, use_ptr, mem_copy, oracle=oracle,
+            name_transport=ntrans, name_lookback=nlook)
+        loc_col = f" | {100*lo:>6.1f}% {100*lr:>6.1f}%" if nlook else ""
         print(f"{tag:<16} {100*c1:>8.1f}% {100*c5:>8.1f}% {100*r1:>8.1f}% "
-              f"{100*afc:>5.1f}% | {mc:>8.3f} {mr:>8.3f}")
-    print("-" * 74)
+              f"{100*afc:>5.1f}% | {mc:>8.3f} {mr:>8.3f}{loc_col}")
+    print("-" * (74 + (18 if nlook else 0)))
     print("cue-top5 = REAL selective binding | recency1 = shortcut rate (want LOW)")
     print("2AFC = P(cue>recency), chance 50% | readCue/readRec = retrieval mass at "
           "cue vs recency source")
+    if nlook:
+        print("locObj = lookback a[obj] argmax hits clause subject | "
+              "locRec = a[recall] argmax hits cue name (name-localization accuracy)")
 
     # ── k-SWEEP: cue accuracy vs. number of simultaneous entities ────────────────
     # The S=32 modular-hash caveat: subject->slot is subj_id % 32, so as the number
@@ -189,18 +229,21 @@ def main():
     # collide onto one slot and binding degrades. This sweep is the key measurement
     # (not just the headline mixed-k cue-top5): watch cue-top5/2AFC fall as k rises.
     print(f"\n[k-sweep] cue accuracy vs #simultaneous entities (HELD-OUT; slots S=32)")
+    loc_hdr = f" {'locObj':>7} {'locRec':>7}" if nlook else ""
     print(f"{'k':>3} {'cue-top1':>9} {'cue-top5':>9} {'recency1':>9} "
-          f"{'2AFC':>6} | {'readCue':>8} {'readRec':>8} {'n':>5}")
-    print("-" * 70)
+          f"{'2AFC':>6} | {'readCue':>8} {'readRec':>8}{loc_hdr} {'n':>5}")
+    print("-" * (70 + (16 if nlook else 0)))
     for k in (2, 3, 4, 5, 6, 8, 10):
         res = measure(model, device, sp, test_objs, k, use_ptr, mem_copy,
-                      oracle=oracle, k_fixed=k, name_transport=ntrans)
+                      oracle=oracle, k_fixed=k, name_transport=ntrans,
+                      name_lookback=nlook)
         if res[-1] == 0:
             print(f"{k:>3}   (skipped: cannot sample {k} distinct subjects/objects)")
             continue
-        c1, c5, r1, afc, mc, mr, nn = res
+        c1, c5, r1, afc, mc, mr, lo, lr, nn = res
+        loc_col = f" {100*lo:>6.1f}% {100*lr:>6.1f}%" if nlook else ""
         print(f"{k:>3} {100*c1:>8.1f}% {100*c5:>8.1f}% {100*r1:>8.1f}% "
-              f"{100*afc:>5.1f}% | {mc:>8.3f} {mr:>8.3f} {nn:>5}")
+              f"{100*afc:>5.1f}% | {mc:>8.3f} {mr:>8.3f}{loc_col} {nn:>5}")
     print("-" * 70)
     print("expect cue-top5 & 2AFC to fall as k -> S=32 (subject-slot collisions under subj%32)")
 

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from core.node import WebNode
 from core.rope import SpiderWebRoPE
 from core.memory import OrbitalQueryRead, StructuralOrbitalRead, SeparableMemoryRead
-from core.hybrid import HybridLookbackAttention
+from core.hybrid import HybridLookbackAttention, NameLookback
 
 
 class SpiderWeb(nn.Module):
@@ -66,6 +66,14 @@ class SpiderWeb(nn.Module):
         self.hybrid_lookback = HybridLookbackAttention(
             config, lookback_width=getattr(config.model, "lookback_width", 32)
         )
+
+        # ── Name-lookback (Step 2): learned governing-name locator ─────────────
+        # Replaces the name_transport oracle. Locates the governing name token and
+        # transports its VERBATIM embedding to serve as the separable-memory slot
+        # key (id_key). Active only when config.model.name_lookback; its attention
+        # is supervised toward name_src in training, but name_src NEVER enters the
+        # forward — at inference it must locate the name unaided.
+        self.name_lookback = NameLookback(config)
 
     def forward(self, input_ids, tau=1.0, hard=False, return_ring_stats=False,
                 use_query_read=None, use_struct_read=None, struct_mask=None,
@@ -340,6 +348,7 @@ class SpiderWeb(nn.Module):
         #   write_mode == "separable" -> active     write_mode == "blend" -> off (baseline)
         write_mode = getattr(self.cfg.memory, "write_mode", "blend")
         sep_stats = None
+        name_stats = None                 # name-lookback attn/name_hat, or None (off)
         if write_mode == "separable":
             ob = getattr(self.cfg.model, "oracle_bind", False)
             # IDENTITY-KEY ADDRESSING: feed the slot key/query from the raw token
@@ -360,6 +369,17 @@ class SpiderWeb(nn.Module):
                 gidx = name_src.clamp_min(0).unsqueeze(-1).expand(-1, -1, self.d)
                 gathered = torch.gather(id_key, 1, gidx)                   # embed at name pos
                 id_key = torch.where(sel, gathered, id_key)
+            # NAME-LOOKBACK (Step 2): LEARN to locate the governing name instead of
+            # gathering it by oracle position. name_hat[t] = sum_u a[t,u]*embed(u) is
+            # an identity-preserving transport of raw embeddings; it BECOMES the slot
+            # key (id_key). name_src is NOT read here — the lookback attention is
+            # supervised toward it externally (train only), so at inference the module
+            # locates the name on its own. Overrides the id_key source entirely.
+            if getattr(self.cfg.model, "name_lookback", False):
+                tok_emb = self.embed(input_ids)                            # raw embeddings (value)
+                name_hat, name_stats = self.name_lookback(x, tok_emb)
+                id_key = name_hat                                          # learned lookback OUTPUT feeds the key
+                name_stats["name_hat"] = name_hat                          # on-graph; == id_key (wiring check)
             x, sep_stats = self.separable_mem(x, causal=True,
                                               subj_id=subj_id, oracle_bind=ob,
                                               id_key=id_key, oracle_alpha=oracle_alpha)
@@ -475,6 +495,7 @@ class SpiderWeb(nn.Module):
             "struct_lookback":  struct_lookback,  # frac of attn mass off-self, or None
             "write_mode":       write_mode,
             "sep_stats":        sep_stats,        # gate/routing stats, or None (blend)
+            "name_stats":       name_stats,       # name-lookback attn + name_hat, or None
             "use_hybrid":       use_hyb,
             "hybrid_stats":     hybrid_stats,     # lookback gate stats, or None (off)
             "use_pointer":      use_ptr,

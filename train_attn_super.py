@@ -58,7 +58,7 @@ TS_PATH    = "data/raw/tinystories.txt"
 PAD_ID     = 0
 IGNORE     = -1                      # SpiderWebLoss CE ignore_index
 NEW_PREFIXES = ("hybrid_lookback", "separable_mem", "query_read",
-                "struct_read", "recall_proj", "copy_gate")
+                "struct_read", "recall_proj", "copy_gate", "name_lookback")
 
 # ── synthetic binding vocabulary (superset; probe tests ball/hat/key/car) ──
 OBJECTS = ["ball","hat","cat","dog","book","cup","kite","doll","box","drum",
@@ -95,7 +95,8 @@ MULTI_RECALL = ["Then {name} {verb} the {obj}", "{name} wanted the {obj}",
 def ft_config(batch_size, slots, steps, use_pointer=False,
               warm_gen=False, lambda_floor=0.0, mem_copy=False,
               mem_copy_scale=12.0, write_mode="blend", no_meanpool=False,
-              oracle_bind=False, id_key=False, name_transport=False) -> Config:
+              oracle_bind=False, id_key=False, name_transport=False,
+              name_lookback=False) -> Config:
     return Config(
         model=ModelConfig(dim=64, hidden_dim=256, num_rings=4, nodes_per_ring=8,
                           vocab_size=5000, max_seq_len=256,
@@ -109,7 +110,8 @@ def ft_config(batch_size, slots, steps, use_pointer=False,
                           mem_copy_scale=mem_copy_scale,
                           oracle_bind=oracle_bind,                     # subject-keyed oracle
                           id_key_addr=id_key,                          # identity-key addressing
-                          name_transport=name_transport),              # name-transport key oracle
+                          name_transport=name_transport,               # name-transport key oracle
+                          name_lookback=name_lookback),                # Step 2: learned name locator
         memory=MemoryConfig(slots=slots, alpha=0.9, beta=0.1, write_mode=write_mode),
         lorenz=LorenzConfig(),
         routing=RoutingConfig(temp_start=0.3, temp_end=0.1,
@@ -339,6 +341,42 @@ def addr_supervision(out, recall_pos, subj, S):
     return loss, w_acc, r_acc, n_w, n_r
 
 
+def name_supervision(out, name_src):
+    """L_name (Step 2) — teach the NAME-LOOKBACK where the governing name is.
+
+    The lookback attention a[t] (out["name_stats"]["attn"], on-graph) is pulled by
+    NLL toward the labeled governing-name position name_src[t] for EVERY labeled
+    position (each object-intro -> its clause SUBJECT name; the recall -> the CUE
+    name). These labels are the SAME name_src the name_transport oracle used, but
+    here they are used ONLY as targets: name_src NEVER enters the forward pass, so
+    at inference the lookback must locate the name itself (the whole point of Step 2).
+
+        L_name = - mean_over_labeled(t)  log a[t, name_src[t]]
+
+    Returns (loss, realized_mass, argmax_acc, n_labeled). loss is on-graph and
+    reaches ONLY the lookback's q_proj/k_proj via a — not the value path (the raw
+    embedding, which a does not weight in this loss) nor write_key/read_query
+    (name_hat feeds them, but name_hat is absent from L_name)."""
+    ns = out.get("name_stats")
+    if ns is None or "attn" not in ns:
+        z = torch.zeros((), device=name_src.device)
+        return z, 0.0, 0.0, 0
+    a = ns["attn"].float()                                    # (B,T,u) on-graph
+    mask = (name_src >= 0)                                    # (B,T) labeled query positions
+    if int(mask.sum().item()) == 0:
+        return a.sum() * 0.0, 0.0, 0.0, 0
+    bpos, tpos = mask.nonzero(as_tuple=True)
+    rows = a[bpos, tpos, :]                                   # (n, u)
+    tgt  = name_src[bpos, tpos]                               # (n,) governing-name positions
+    logp = torch.log(rows.clamp_min(1e-9))
+    loss = F.nll_loss(logp, tgt)
+    with torch.no_grad():
+        idx  = torch.arange(bpos.numel(), device=rows.device)
+        mass = rows[idx, tgt].mean().item()                  # attn mass on the true name
+        acc  = (rows.argmax(-1) == tgt).float().mean().item()  # localization accuracy
+    return loss, mass, acc, bpos.numel()
+
+
 def gate_router_loss(out, recall_pos, is_bind, targets):
     """FIX C — supervise the copy gate lambda as a ROUTER so copy fires ONLY on the
     'emit the bound entity' token and generation handles all other language.
@@ -372,7 +410,8 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
         use_pointer=False, base_ckpt=BASE_CKPT,
         warm_gen=False, lambda_floor=0.0, w_router=0.0, p_bind=None,
         mem_copy=False, multi_entity=False, oracle_bind=False,
-        w_addr=0.0, id_key=False, oracle_anneal=False, name_transport=False):
+        w_addr=0.0, id_key=False, oracle_anneal=False, name_transport=False,
+        name_lookback=False, w_name=0.0):
     torch.manual_seed(42); random.seed(123)
     global P_BIND, MULTI_ENTITY
     if p_bind is not None:
@@ -391,6 +430,12 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
     # name-substitution at the write/read positions, so it implies id_key.
     if name_transport:
         id_key = True
+    # name-lookback (Step 2) supplies its OWN addressing key (name_hat, an
+    # embedding transport) that OVERRIDES id_key in web.py — so it needs neither
+    # the id_key_addr embed source nor the name_transport gather. It is mutually
+    # exclusive with the name_transport oracle it replaces.
+    if name_lookback:
+        assert not name_transport, "name_lookback replaces name_transport; do not set both"
 
     ckpt_path = f"{out_dir}/last.pt" if resume else base_ckpt
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -401,7 +446,8 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
                     warm_gen=warm_gen, lambda_floor=lambda_floor,
                     mem_copy=mem_copy, write_mode=write_mode,
                     no_meanpool=no_meanpool, oracle_bind=oracle_bind,
-                    id_key=id_key, name_transport=name_transport)
+                    id_key=id_key, name_transport=name_transport,
+                    name_lookback=name_lookback)
     start_step = int(ckpt.get("step", 0)) if resume else 0
 
     model = SpiderWeb(cfg).to(device)
@@ -435,6 +481,11 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
           f"gathered via name_src; corrects the key-source bug)"
           if name_transport else "[as] NAME_TRANSPORT=False (key = token's own embedding)",
           flush=True)
+    print(f"[as] NAME_LOOKBACK={name_lookback} w_name={w_name} "
+          f"(Step 2: LEARNED name locator -> name_hat=sum_u a[t,u]*embed(u) feeds id_key; "
+          f"attn a supervised toward name_src via L_name; name_src NEVER in forward — "
+          f"located unaided at inference)"
+          if name_lookback else "[as] NAME_LOOKBACK=False", flush=True)
 
     loss_fn = SpiderWebLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr,
@@ -479,7 +530,8 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
                     "oracle_bind": oracle_bind,
                     "id_key_addr": id_key, "w_addr": w_addr,
                     "oracle_anneal": oracle_anneal,
-                    "name_transport": name_transport}, path)
+                    "name_transport": name_transport,
+                    "name_lookback": name_lookback, "w_name": w_name}, path)
 
     print(f"[as] {'Step':>6} {'CE':>8} {'EMA':>8} {'genCE':>7} {'attnL':>7} "
           f"{'mass':>6} {'lam':>6} {'lamRcl':>6} {'rout':>6} {'tau':>5} | "
@@ -493,9 +545,15 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
         # oracle anneal: alpha 1->0 linearly, handing routing to the learned router
         # while value/emit stay trained (distillation). alpha=1 unless annealing.
         alpha = (max(0.0, 1.0 - step / max(1, steps - 1)) if oracle_anneal else 1.0)
+        # CRITICAL (Step 2, no label leakage): the name-lookback must LOCATE the
+        # name, so name_src is NOT handed to the forward — it is used ONLY as the
+        # L_name target below. name_transport (the oracle path) still needs it.
+        fwd_name_src = None if name_lookback else nsrc
+        if name_lookback:
+            assert fwd_name_src is None, "name_src must be absent from the name_lookback forward"
         with ac:
             out = model(x, tau=tau, hard=False, subj_id=subj, oracle_alpha=alpha,
-                        name_src=nsrc)
+                        name_src=fwd_name_src)
             if on_cuda and cfg.train.use_bf16:
                 out["logits"] = out["logits"].float()
             loss, mets = loss_fn(out, y, entropy_weight=cfg.train.entropy_weight,
@@ -516,6 +574,12 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
             addr_loss, addr_wacc, addr_racc, n_aw, n_ar = addr_supervision(out, rp, subj, slots)
             if w_addr > 0:
                 loss = loss + w_addr * addr_loss
+            # NAME link (Step 2): supervise the LEARNED name-lookback attention
+            # toward the governing-name positions (name_src as TARGET only). Gated
+            # by w_name; the located name feeds id_key with name_src OFF at inference.
+            name_loss, name_mass, name_acc, n_nm = name_supervision(out, nsrc)
+            if w_name > 0:
+                loss = loss + w_name * name_loss
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"[as] *** NaN/Inf at step {step}. Stopping. ***", flush=True)
             return True
@@ -558,6 +622,12 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
             print(f"[as]   step-{start_step} L_addr={addr_loss.item():.3f} "
                   f"writeSlotAcc={addr_wacc:.3f} readSlotAcc={addr_racc:.3f} "
                   f"alpha={alpha:.3f} (n_write={n_aw} n_read={n_ar})", flush=True)
+            if name_lookback:
+                ns0 = out.get("name_stats") or {}
+                print(f"[as]   step-{start_step} L_name={name_loss.item():.3f} "
+                      f"nameMass={name_mass:.3f} nameLocAcc={name_acc:.3f} "
+                      f"attnEntropy={ns0.get('entropy', float('nan')):.3f} "
+                      f"(n_name={n_nm}; entropy starts diffuse — expected)", flush=True)
         elif step <= start_step + 50 and step % 10 == 0:
             _line(step)
         elif step % 250 == 0 or step == steps - 1:
@@ -565,6 +635,11 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
             if w_addr > 0:
                 print(f"[as]   L_addr={addr_loss.item():.3f} writeSlotAcc={addr_wacc:.3f} "
                       f"readSlotAcc={addr_racc:.3f} alpha={alpha:.3f}", flush=True)
+            if name_lookback:
+                ns0 = out.get("name_stats") or {}
+                print(f"[as]   L_name={name_loss.item():.3f} nameMass={name_mass:.3f} "
+                      f"nameLocAcc={name_acc:.3f} attnEntropy="
+                      f"{ns0.get('entropy', float('nan')):.3f}", flush=True)
             save(f"{out_dir}/last.pt", step + 1, ema)
         if step > cfg.train.warmup_steps and ema < best:
             best = ema; save(f"{out_dir}/best.pt", step + 1, ema)
@@ -576,6 +651,10 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
         print(f"[as] DONE L_addr: w_addr={w_addr} id_key={id_key} "
               f"final writeSlotAcc={addr_wacc:.3f} readSlotAcc={addr_racc:.3f} "
               f"(learned addressing; oracle OFF at inference)", flush=True)
+    if name_lookback:
+        print(f"[as] DONE L_name: w_name={w_name} final nameLocAcc={name_acc:.3f} "
+              f"nameMass={name_mass:.3f} (learned name locator; name_src OFF at inference)",
+              flush=True)
     nanp = [n for n, p in model.named_parameters() if p.isnan().any()]
     print(f"[as] {'no NaN in weights' if not nanp else 'NaN weights: '+str(nanp)}",
           flush=True)
@@ -619,6 +698,13 @@ def main():
     ap.add_argument("--name_transport", action="store_true",
                     help="key-source oracle: at write/read positions source the slot "
                          "key from the SUBJECT-/CUE-NAME token embedding (implies --id_key)")
+    ap.add_argument("--name_lookback", action="store_true",
+                    help="Step 2: LEARNED name locator that replaces the name_transport "
+                         "oracle. name_hat=sum_u a[t,u]*embed(u) feeds id_key; the attn a is "
+                         "supervised toward name_src (train only) via --w_name. name_src is "
+                         "NEVER in the forward — located unaided at inference.")
+    ap.add_argument("--w_name", type=float, default=0.0,
+                    help="weight on L_name (name-lookback supervision toward name_src)")
     a = ap.parse_args()
     for bs in (48, 32, 24, 16):
         try:
@@ -629,7 +715,8 @@ def main():
                 multi_entity=a.multi_entity, oracle_bind=a.oracle_bind,
                 w_addr=a.w_addr, id_key=a.id_key,
                 oracle_anneal=a.oracle_anneal,
-                name_transport=a.name_transport); return
+                name_transport=a.name_transport,
+                name_lookback=a.name_lookback, w_name=a.w_name); return
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             print(f"[as] OOM at batch={bs}, falling back.", flush=True)

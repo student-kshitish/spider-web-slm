@@ -72,6 +72,22 @@ class ModelConfig:
                                    #     failed only because the key was read from the wrong token
                                    #     (embed("ball")/embed("the") carry no subject identity).
                                    #     Other positions keep the default id_key source.
+    name_lookback: bool = False    # NAME-LOOKBACK (Step 2 — removes the last oracle):
+                                   #     a LEARNED causal single-head attention (core.hybrid.
+                                   #     NameLookback) that LOCATES the governing name itself
+                                   #     instead of being handed its position (name_src). At
+                                   #     each position t it forms name_hat[t] = sum_u a[t,u] *
+                                   #     embed(input_ids[u]) — an IDENTITY-PRESERVING transport
+                                   #     of raw embeddings (mirrors the mem_copy path), NOT a
+                                   #     mix of hidden states — and feeds name_hat as the id_key
+                                   #     to SeparableMemoryRead's write_key/read_query. The
+                                   #     lookback attention a is exposed on-graph (name_stats
+                                   #     ["attn"]) and supervised toward the known name positions
+                                   #     (L_name, train only). name_src is used ONLY in that aux
+                                   #     loss — the forward pass NEVER reads it, so at inference
+                                   #     the model must find the name on its own. Supersedes the
+                                   #     name_transport oracle (only changed variable: how the
+                                   #     name reaches the key — gather -> learned lookback).
     no_meanpool: bool = False      # (4) DON'T collapse the T axis when writing node memory
                                    #     (web.py:172). Registry stays position-resolved
                                    #     (B,T,slots,d) so an entity written at position k is

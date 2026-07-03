@@ -122,3 +122,82 @@ class HybridLookbackAttention(nn.Module):
         # after the no_grad block so it stays differentiable.
         stats["attn"] = attn
         return x_out, stats
+
+
+class NameLookback(nn.Module):
+    """
+    Learned NAME-lookback (Step 2 — removes the last oracle).
+
+    The name_transport experiment proved that if the slot key at each object-intro
+    / recall position is sourced from the governing NAME token's embedding, the
+    learned router forms subject-keyed addresses and binds selectively (2AFC
+    53%->82%). But it still HANDED the model the name's POSITION (name_src). This
+    module removes that oracle: it LOCATES the governing name itself.
+
+    Mechanism (a causal single-head attention)
+    ------------------------------------------
+        q_t = W_q x_t ;  k_u = W_k x_u          (from the MIXED hidden state x,
+                                                 which carries the positional /
+                                                 syntactic context needed to know
+                                                 "which earlier name governs me")
+        a[t,u] = softmax_{u<=t}( q_t . k_u / sqrt(d) )        # causal
+        name_hat[t] = sum_{u<=t} a[t,u] * token_emb[u]        # embed(input_ids[u])
+
+    CRITICAL — the VALUE is the RAW EMBEDDING token_emb = embed(input_ids), NOT the
+    mixed state x. The name identity must ride VERBATIM into the key (exactly the
+    mem_copy embedding-transport path). Transporting mixed x instead would smear
+    the name the same way addr_learned failed. There is deliberately NO v_proj:
+    the transported vector is the embedding itself, unmodified.
+
+    Supervision (train only, gated by --w_name)
+    -------------------------------------------
+    The attention `a` is exposed on-graph (stats["attn"]) and pulled toward the
+    known name positions via an NLL aux (train_attn_super.name_supervision). Those
+    labels (name_src) are used ONLY in that loss — this forward NEVER receives
+    them, so at inference the module must find the name unaided.
+
+    Init: q_proj/k_proj get the default (small random) init, so scores are ~0 and
+    the attention starts DIFFUSE (high entropy) — expected; the supervision sharpens
+    it. (Zero-init BOTH would kill the q/k cross-gradient, so it is avoided.)
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        d = config.model.dim
+        self.d = d
+        self.q_proj = nn.Linear(d, d, bias=False)   # query from mixed state x
+        self.k_proj = nn.Linear(d, d, bias=False)   # key   from mixed state x
+        # NO v_proj / o_proj: the value is the verbatim token embedding, and the
+        # output (name_hat) is fed straight in as the addressing key.
+
+    def forward(self, x, token_emb):
+        """
+        x         : (B,T,d)  mixed hidden state — QUERY/KEY source (context to locate).
+        token_emb : (B,T,d)  raw embed(input_ids) — the VALUE, transported verbatim.
+        returns (name_hat (B,T,d), stats). stats["attn"] (B,T,u) is on-graph for the
+        name-supervision aux; name_hat is the identity-preserving lookback output.
+        """
+        B, T, d = x.shape
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        scores = torch.einsum("btd,bud->btu", q, k) / (d ** 0.5)     # (B,T,u)
+        scores = scores.float()
+
+        t_idx = torch.arange(T, device=x.device).view(T, 1)
+        u_idx = torch.arange(T, device=x.device).view(1, T)
+        allowed = u_idx <= t_idx                                     # causal (u <= t)
+        scores = scores.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+        attn = torch.softmax(scores, dim=-1)                        # (B,T,u) float
+
+        # IDENTITY TRANSPORT: name_hat[t] = sum_u a[t,u] * embed(input_ids[u]).
+        # token_emb is the raw embedding table lookup, so the name rides verbatim.
+        name_hat = torch.einsum("btu,bud->btd", attn.to(token_emb.dtype), token_emb)
+
+        with torch.no_grad():
+            ent = -(attn.clamp_min(1e-9).log() * attn).sum(-1).mean()   # attention entropy
+            stats = {
+                "entropy":   float(ent),
+                "self_mass": float(attn.diagonal(dim1=1, dim2=2).mean()),
+            }
+        stats["attn"] = attn        # (B,T,u) ON-GRAPH — name-supervision target
+        return name_hat, stats

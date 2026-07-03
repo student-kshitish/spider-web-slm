@@ -116,20 +116,27 @@ def load_model():
     if ABLATE_SEP:
         wm = "blend"           # isolation: separable read OFF at inference
     cfg.memory.write_mode = wm
-    # pointer integration flags: rebuild the readout exactly as trained so the
-    # mixture P (and lambda floor) at eval matches training.
-    cfg.model.use_pointer          = bool(ckpt.get("use_pointer", False))
-    cfg.model.pointer_warm_gen     = bool(ckpt.get("pointer_warm_gen", False))
-    cfg.model.pointer_lambda_floor = float(ckpt.get("pointer_lambda_floor", 0.0))
-    cfg.model.mem_copy             = bool(ckpt.get("mem_copy", False))
-    cfg.model.mem_copy_scale       = float(ckpt.get("mem_copy_scale", 12.0))
-    cfg.model.oracle_bind          = bool(ckpt.get("oracle_bind", False))
-    cfg.model.id_key_addr          = bool(ckpt.get("id_key_addr", False))
-    cfg.model.name_transport       = bool(ckpt.get("name_transport", False))
+    # ── GENERIC flag restore: rebuild the EXACT architecture/forward path the
+    # checkpoint was trained with. Any checkpoint-meta key that names a
+    # ModelConfig field is copied over, coerced to that field's type. This
+    # replaces hand-listing flags — the pattern that silently DROPPED
+    # name_lookback and ran the wrong architecture at eval (locRec 0% while
+    # training showed 0.99). A NEW training flag using the same name now
+    # auto-restores here, so the bug class can't recur on a future checkpoint.
+    #   Skipped: `no_meanpool` (encoded in `fixes`, set above via OR) and
+    #   `write_mode` (lives in cfg.memory, set above). None values keep the
+    #   ModelConfig default (older checkpoints store unset flags as None).
+    for k, v in ckpt.items():
+        if k in ("model", "optimizer", "lr_sched", "no_meanpool") or v is None:
+            continue
+        if hasattr(cfg.model, k):
+            cur = getattr(cfg.model, k)
+            setattr(cfg.model, k,
+                    type(cur)(v) if isinstance(cur, (bool, int, float)) else v)
     model = SpiderWeb(cfg).to(device)
     miss, unexp = model.load_state_dict(state, strict=False)
     new_pref = ("hybrid_lookback", "separable_mem", "query_read",
-                "struct_read", "recall_proj")
+                "struct_read", "recall_proj", "copy_gate", "name_lookback")
     bad = [k for k in miss if not k.startswith(new_pref)]
     assert not bad and not unexp, f"load mismatch: missing={bad} unexpected={unexp}"
     print(f"[probe] arch flags: sharp_head={cfg.model.sharp_head} "
