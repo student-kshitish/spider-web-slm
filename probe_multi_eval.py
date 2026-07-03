@@ -184,6 +184,56 @@ def measure(model, device, sp, objs, seed, use_ptr, mem_copy, oracle=False,
             loc_obj, loc_rec, n)
 
 
+@torch.no_grad()
+def addr_diagnostics(model, device, sp, objs, seed, n_ex, name_lookback):
+    """Step-3 self-organization diagnostics on the LEARNED slot routing
+    (sep_stats write_w/read_w), with the hash target gone. Reports:
+      - routeEntropy : mean H of write_w (entity intros) & read_w (recall), in
+        nats. Lower = confident slot commitment (the thing --w_entropy sharpens);
+        max = ln(S). Diffuse routing (names smeared over slots) shows high entropy.
+      - slotAgree    : for the SAME name, does its write-side occurrence (cue
+        subject's object-intro) route to the SAME argmax slot as its read-side
+        occurrence (the recall)? This is what makes retrieval work WITHOUT a hash.
+      - distinctSlots: #slots that ever win an argmax across labeled positions —
+        detects collapse (few slots) vs healthy spread (up to min(#names, S)).
+    Labels are used ONLY for scoring; name_src stays None in the forward."""
+    rng = random.Random(seed)
+    Hs, agree_hit, agree_tot, used = [], 0, 0, set()
+    n = 0
+    while n < n_ex:
+        k = rng.choice([2, 3])
+        text, cobj, robj, ent_pairs, cue_name = make_multi(rng, objs, k)
+        pieces = sp.encode(text, out_type=str)
+        ids = sp.EncodeAsIds(text)
+        inp = torch.tensor([ids], dtype=torch.long, device=device)
+        ns = None
+        if name_lookback:
+            assert ns is None, "name_src must be disabled at inference"
+        out = model(inp, tau=0.1, hard=True, use_pointer=True, name_src=ns)
+        ss = out.get("sep_stats")
+        if ss is None or "write_w" not in ss:
+            return None
+        ww = ss["write_w"][0].float(); rw = ss["read_w"][0].float()   # (T,S)
+        def H(p): return float(-(p.clamp_min(1e-9).log() * p).sum())
+        rp = len(ids) - 1
+        for ob, nm in ent_pairs:                       # entropy + slot usage at intros
+            op = tok_pos(pieces, ob)
+            if op is None:
+                continue
+            Hs.append(H(ww[op])); used.add(int(ww[op].argmax()))
+        Hs.append(H(rw[rp])); used.add(int(rw[rp].argmax()))
+        cw = tok_pos(pieces, cobj)                      # cue name: write vs read slot
+        if cw is not None:
+            agree_tot += 1
+            agree_hit += int(ww[cw].argmax().item() == rw[rp].argmax().item())
+        n += 1
+    if n == 0 or not Hs:
+        return None
+    return (sum(Hs) / len(Hs),
+            (agree_hit / agree_tot) if agree_tot else float("nan"),
+            len(used), n)
+
+
 def main():
     sp = spm.SentencePieceProcessor(); sp.Load("data/tokenizer.model")
     vocab = json.load(open("data/wide_vocab.json"))
@@ -196,9 +246,10 @@ def main():
     oracle   = bool(meta.get("oracle_bind", False))
     ntrans   = bool(meta.get("name_transport", False))
     nlook    = bool(meta.get("name_lookback", False))
+    caddr    = bool(meta.get("content_addr", False))
     print(f"\n[multi-eval] ckpt={CKPT} ema_ce={ema} n={N}/group "
           f"use_pointer={use_ptr} mem_copy={mem_copy} oracle_bind={oracle} "
-          f"name_transport={ntrans} name_lookback={nlook}")
+          f"name_transport={ntrans} name_lookback={nlook} content_addr={caddr}")
     if nlook:
         print("[multi-eval] name_lookback: name_src DISABLED at inference "
               "(locator finds the name itself); reporting name-localization accuracy.")
@@ -246,6 +297,27 @@ def main():
               f"{100*afc:>5.1f}% | {mc:>8.3f} {mr:>8.3f}{loc_col} {nn:>5}")
     print("-" * 70)
     print("expect cue-top5 & 2AFC to fall as k -> S=32 (subject-slot collisions under subj%32)")
+
+    # ── STEP-3 SELF-ORGANIZATION DIAGNOSTICS (content_addr) ──────────────────────
+    # With the subj%S hash target dropped, is the routing still confident, does the
+    # same name reach the same slot write-vs-read, and are slots spread (not collapsed)?
+    if caddr:
+        import math
+        print(f"\n[addr-diag] content_addr self-organization (hash target REMOVED). "
+              f"S={meta.get('write_mode','?')} slots; max entropy = ln(S).")
+        print(f"{'group':<16} {'routeEntropy':>13} {'slotAgree':>10} {'distinctSlots':>14}")
+        print("-" * 56)
+        for tag, objs in [("TRAINED", train_objs), ("HELD-OUT", test_objs)]:
+            d = addr_diagnostics(model, device, sp, objs, 0, N, nlook)
+            if d is None:
+                print(f"{tag:<16} (no sep_stats — not a separable-memory checkpoint)")
+                continue
+            ent, agree, ndist, nn = d
+            print(f"{tag:<16} {ent:>13.3f} {100*agree:>9.1f}% {ndist:>14}")
+        print("-" * 56)
+        print("routeEntropy: lower = confident slot commitment (diffuse routing = high) | "
+              "slotAgree: same name -> same slot write-vs-read (retrieval needs this) | "
+              "distinctSlots: watch for collapse (few) vs healthy spread")
 
 
 if __name__ == "__main__":

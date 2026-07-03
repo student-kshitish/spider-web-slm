@@ -377,6 +377,42 @@ def name_supervision(out, name_src):
     return loss, mass, acc, bpos.numel()
 
 
+def route_entropy_penalty(out, recall_pos, subj):
+    """Optional --w_entropy sharpener for --content_addr (Step 3).
+
+    When the subj%S hash target (L_addr) is removed, nothing forces the slot
+    routing to be CONFIDENT — it could stay diffuse (a name smeared over many
+    slots). This penalizes the ENTROPY of the routing at the labeled positions
+    (write_w at entity object-intros, read_w at the recall) so the router commits
+    to a slot — WITHOUT dictating WHICH slot (that is exactly what L_addr did and
+    what we are dropping). Self-organization decides the assignment; this only
+    sharpens it. Uses the SAME labeled masks as addr_supervision. On-graph via
+    sep_stats["write_w"/"read_w"]. Returns (loss, entropy_value, n_positions)."""
+    ss = out.get("sep_stats")
+    if ss is None or "write_w" not in ss:
+        z = torch.zeros((), device=subj.device)
+        return z, float("nan"), 0
+    ww = ss["write_w"].float()                       # (B,T,S) on-graph
+    rw = ss["read_w"].float()
+    B, T, _ = ww.shape
+    ar = torch.arange(B, device=subj.device)
+    read_mask = torch.zeros(B, T, dtype=torch.bool, device=subj.device)
+    read_mask[ar, recall_pos] = True
+    read_mask &= (subj >= 0)                          # TS rows (subj all -1) excluded
+    write_mask = (subj >= 0) & ~read_mask
+    def H(p):                                         # row entropy (nats)
+        return -(p.clamp_min(1e-9).log() * p).sum(-1)
+    terms = []
+    if write_mask.any():
+        terms.append(H(ww[write_mask]).mean())
+    if read_mask.any():
+        terms.append(H(rw[read_mask]).mean())
+    if not terms:
+        return ww.sum() * 0.0, float("nan"), 0
+    loss = sum(terms) / len(terms)
+    return loss, float(loss.detach()), int(write_mask.sum() + read_mask.sum())
+
+
 def gate_router_loss(out, recall_pos, is_bind, targets):
     """FIX C — supervise the copy gate lambda as a ROUTER so copy fires ONLY on the
     'emit the bound entity' token and generation handles all other language.
@@ -411,7 +447,7 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
         warm_gen=False, lambda_floor=0.0, w_router=0.0, p_bind=None,
         mem_copy=False, multi_entity=False, oracle_bind=False,
         w_addr=0.0, id_key=False, oracle_anneal=False, name_transport=False,
-        name_lookback=False, w_name=0.0):
+        name_lookback=False, w_name=0.0, content_addr=False, w_entropy=0.0):
     torch.manual_seed(42); random.seed(123)
     global P_BIND, MULTI_ENTITY
     if p_bind is not None:
@@ -486,6 +522,25 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
           f"attn a supervised toward name_src via L_name; name_src NEVER in forward — "
           f"located unaided at inference)"
           if name_lookback else "[as] NAME_LOOKBACK=False", flush=True)
+    print(f"[as] CONTENT_ADDR={content_addr} w_entropy={w_entropy} "
+          f"(Step 3: DROP the subj%{slots} hash target — routing self-organizes by "
+          f"name content; L_addr computed as diagnostic only, NOT in loss"
+          f"{'; +entropy sharpener' if (content_addr and w_entropy>0) else ''})"
+          if content_addr else "[as] CONTENT_ADDR=False (L_addr hash target active if w_addr>0)",
+          flush=True)
+    if content_addr and w_addr > 0:
+        print(f"[as] NOTE: --content_addr overrides --w_addr={w_addr}; the L_addr hash "
+              f"target is DISABLED (self-organization). writeSlotAcc printed vs-hash "
+              f"is a diagnostic, not a target.", flush=True)
+    # active loss terms (what actually enters `loss`)
+    _terms = ["genCE"]
+    if w_attn   > 0:                    _terms.append(f"{w_attn}*attn(retrieve)")
+    if w_router > 0:                    _terms.append(f"{w_router}*router")
+    if w_addr   > 0 and not content_addr: _terms.append(f"{w_addr}*L_addr(hash)")
+    if content_addr and w_entropy > 0:  _terms.append(f"{w_entropy}*route_entropy")
+    if w_name   > 0:                    _terms.append(f"{w_name}*L_name")
+    print(f"[as] ACTIVE LOSS TERMS: {' + '.join(_terms)}"
+          f"{'   [L_addr hash target REMOVED]' if content_addr else ''}", flush=True)
 
     loss_fn = SpiderWebLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr,
@@ -531,7 +586,8 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
                     "id_key_addr": id_key, "w_addr": w_addr,
                     "oracle_anneal": oracle_anneal,
                     "name_transport": name_transport,
-                    "name_lookback": name_lookback, "w_name": w_name}, path)
+                    "name_lookback": name_lookback, "w_name": w_name,
+                    "content_addr": content_addr, "w_entropy": w_entropy}, path)
 
     print(f"[as] {'Step':>6} {'CE':>8} {'EMA':>8} {'genCE':>7} {'attnL':>7} "
           f"{'mass':>6} {'lam':>6} {'lamRcl':>6} {'rout':>6} {'tau':>5} | "
@@ -571,9 +627,18 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
                 loss = loss + w_router * router_loss
             # ADDRESS link: supervise the LEARNED slot routing toward subj%S (the
             # oracle target, as a teacher). Gated by w_addr; OFF at inference.
+            # Step 3 (--content_addr): DROP this hash target entirely — routing must
+            # self-organize by name content (write_w=softmax(name_hat.slot_addr)).
+            # addr_loss is still COMPUTED (writeSlotAcc is a diagnostic showing
+            # routing does NOT follow the hash) but NOT added to the loss.
             addr_loss, addr_wacc, addr_racc, n_aw, n_ar = addr_supervision(out, rp, subj, slots)
-            if w_addr > 0:
+            if w_addr > 0 and not content_addr:
                 loss = loss + w_addr * addr_loss
+            # Step 3 optional sharpener: penalize routing entropy (confident slot
+            # choice) WITHOUT dictating which slot. Only under --content_addr.
+            ent_loss, ent_val, n_ent = route_entropy_penalty(out, rp, subj)
+            if content_addr and w_entropy > 0:
+                loss = loss + w_entropy * ent_loss
             # NAME link (Step 2): supervise the LEARNED name-lookback attention
             # toward the governing-name positions (name_src as TARGET only). Gated
             # by w_name; the located name feeds id_key with name_src OFF at inference.
@@ -621,7 +686,14 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
                   f"(n_bind/batch={n_b})", flush=True)
             print(f"[as]   step-{start_step} L_addr={addr_loss.item():.3f} "
                   f"writeSlotAcc={addr_wacc:.3f} readSlotAcc={addr_racc:.3f} "
-                  f"alpha={alpha:.3f} (n_write={n_aw} n_read={n_ar})", flush=True)
+                  f"alpha={alpha:.3f} (n_write={n_aw} n_read={n_ar})"
+                  f"{'  [vs-hash DIAGNOSTIC only; not in loss]' if content_addr else ''}",
+                  flush=True)
+            if content_addr:
+                import math as _m
+                print(f"[as]   step-{start_step} routeEntropy={ent_val:.3f} nats "
+                      f"(max=ln{slots}={_m.log(slots):.2f}; lower=confident slot) "
+                      f"n_ent={n_ent} — self-organization must LOWER this", flush=True)
             if name_lookback:
                 ns0 = out.get("name_stats") or {}
                 print(f"[as]   step-{start_step} L_name={name_loss.item():.3f} "
@@ -632,9 +704,14 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
             _line(step)
         elif step % 250 == 0 or step == steps - 1:
             _line(step)
-            if w_addr > 0:
+            if w_addr > 0 or content_addr:
+                tag = " (vs-hash DIAGNOSTIC, not a target)" if content_addr else ""
                 print(f"[as]   L_addr={addr_loss.item():.3f} writeSlotAcc={addr_wacc:.3f} "
-                      f"readSlotAcc={addr_racc:.3f} alpha={alpha:.3f}", flush=True)
+                      f"readSlotAcc={addr_racc:.3f} alpha={alpha:.3f}{tag}", flush=True)
+            if content_addr:
+                print(f"[as]   routeEntropy={ent_val:.3f} (nats; lower=confident slot; "
+                      f"max=ln{slots}={__import__('math').log(slots):.2f}) n_ent={n_ent}",
+                      flush=True)
             if name_lookback:
                 ns0 = out.get("name_stats") or {}
                 print(f"[as]   L_name={name_loss.item():.3f} nameMass={name_mass:.3f} "
@@ -655,6 +732,10 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
         print(f"[as] DONE L_name: w_name={w_name} final nameLocAcc={name_acc:.3f} "
               f"nameMass={name_mass:.3f} (learned name locator; name_src OFF at inference)",
               flush=True)
+    if content_addr:
+        print(f"[as] DONE CONTENT_ADDR: hash target DROPPED; final routeEntropy={ent_val:.3f} "
+              f"nats writeSlotAcc(vs-hash, diag)={addr_wacc:.3f} w_entropy={w_entropy} "
+              f"(addressing self-organized by name content)", flush=True)
     nanp = [n for n, p in model.named_parameters() if p.isnan().any()]
     print(f"[as] {'no NaN in weights' if not nanp else 'NaN weights: '+str(nanp)}",
           flush=True)
@@ -705,6 +786,13 @@ def main():
                          "NEVER in the forward — located unaided at inference.")
     ap.add_argument("--w_name", type=float, default=0.0,
                     help="weight on L_name (name-lookback supervision toward name_src)")
+    ap.add_argument("--content_addr", action="store_true",
+                    help="Step 3: DROP the subj%%S hash target (L_addr not added to loss); "
+                         "slot routing self-organizes from softmax(name_hat.slot_addr). The "
+                         "forward is UNCHANGED — this is a training-only flag.")
+    ap.add_argument("--w_entropy", type=float, default=0.0,
+                    help="Step 3 optional sharpener (e.g. 0.01): penalize routing entropy for "
+                         "confident slot choice WITHOUT dictating which slot. Only with --content_addr.")
     a = ap.parse_args()
     for bs in (48, 32, 24, 16):
         try:
@@ -716,7 +804,8 @@ def main():
                 w_addr=a.w_addr, id_key=a.id_key,
                 oracle_anneal=a.oracle_anneal,
                 name_transport=a.name_transport,
-                name_lookback=a.name_lookback, w_name=a.w_name); return
+                name_lookback=a.name_lookback, w_name=a.w_name,
+                content_addr=a.content_addr, w_entropy=a.w_entropy); return
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             print(f"[as] OOM at batch={bs}, falling back.", flush=True)
