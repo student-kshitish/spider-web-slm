@@ -144,7 +144,7 @@ Probed with inference tests (temp=0.6, top_k=30, ngram=3, stop_at_sentence).
 
 Within a single sentence the model shows solid syntactic and lexical associations — the right grammatical slot is filled, frequent collocations are predicted confidently, and surface patterns like dialogue punctuation are well-learned.
 
-Capabilities requiring **cross-sentence binding** — coreference, attribute recall, numeric state tracking, relational reasoning — were out of range in the base model. We initially attributed this to model scale and corpus. A focused investigation (next section) overturned that: the failure is **architectural**, not a matter of scale or training budget — probes localize it to a missing primitive (a content-agnostic, identity-preserving copy) the averaging substrate could not supply. That investigation then **supplied the primitive**: a pointer/copy readout, integrated with the language model, recovers generalizing binding (89% top-5 emit on entities never bound in training) **while keeping CE healthy (3.6)** — the substrate now binds *and* models language at once.
+Capabilities requiring **cross-sentence binding** — coreference, attribute recall, numeric state tracking, relational reasoning — were out of range in the base model. We initially attributed this to model scale and corpus. A focused investigation (next sections) overturned that: the failure is **architectural**, not a matter of scale or training budget — probes localize it to a missing primitive (a content-agnostic, identity-preserving copy) the averaging substrate could not supply. That investigation then **supplied the primitive**: a pointer/copy readout, integrated with the language model, recovers generalizing binding (89% top-5 emit on entities never bound in training) **while keeping CE healthy (3.6)** — the substrate now binds *and* models language at once. A follow-on arc extends this to **multi-entity selection** — picking the *cued* entity over a more recent distractor — learned end-to-end with no oracle (held-out 2AFC 74% vs 53% chance), and then maps exactly where the chain still breaks off-template (the copy gate and locator overfit surface form; the identity decode does not).
 
 ---
 
@@ -247,6 +247,75 @@ This is the first arm where **both hold at once**: healthy language modeling (CE
 
 ---
 
+## Multi-Entity Selective Binding (the harder problem)
+
+Single-entity re-emission (above) proves the substrate can copy *the one thing* that was introduced. The real test of binding is **selection**: with **two or three** entities in context, re-emit the one governed by a *cue* — not the most recent one. Every eval case below is built so that **recency is always the wrong answer**, and all metrics are on **held-out entities never bound in training**. The decisive metric is **2AFC** — P(read prefers the cued entity over a random distractor), chance = 50%.
+
+### Content slots are not variable binding
+
+The integrated single-entity model, extended to multiple entities, **fails at selection**:
+
+| Metric (held-out) | Value |
+|---|---|
+| cue-top5 | 60.8% |
+| 2AFC (cue > distractor) | **53.3%** (≈ chance) |
+| readCue / readRec | 0.42 / 0.39 (no discrimination) |
+
+Cue beats recency overall (so it's not a pure recency shortcut), but the memory read **cannot separate cue from distractor** — the above-recency edge comes from the LM prior, not retrieval. Root cause: the copy readout addresses slots by **content similarity** (`read_dist ∝ read_w·write_w`), so the object is stored under the *object's* content, not the *subject's* address. There is no "subject → its object" key; competing entity-intros route to overlapping slots and read mass splits evenly. This is content clustering, **not addressing-by-bound-variable**.
+
+### Oracle probe: the bottleneck is ADDRESSING, not value/emit
+
+To localize the break, we replaced *only* the content router with a perfect subject-keyed one-hot (`--oracle_bind`; slot key at write and query at read = subject id, value/emit path untouched):
+
+| Metric (held-out) | Content router | **Oracle addressing** |
+|---|---:|---:|
+| cue-top5 | 60.8% | **99.2%** |
+| recency-1 (lower better) | 36.7% | **0.8%** |
+| 2AFC | 53.3% | **98.3%** |
+| readCue / readRec | 0.42 / 0.39 | **0.950 / 0.006** |
+
+With correct addressing, the **existing** value/emit/copy pipeline surfaces the right *unseen* entity 99% of the time and crushes recency. So the downstream copy machinery is fine (the `read_w·write_w` mechanism has full 0.95-vs-0.006 dynamic range) — the **only** missing piece is computing `key = f(subject)` at write and `query = f(subject)` at read. That justified building a **learned subject-resolving binder** and removing the oracle one layer at a time.
+
+### The oracle-removal arc (each step removes one crutch)
+
+| Arm | Oracle still present | Held-out 2AFC | What it proves |
+|-----|----------------------|:-------------:|----------------|
+| Content slots (baseline) | — | 53.3% | content clustering ≠ binding |
+| `oracle_bind` | full subject-keyed addressing | **98.3%** | bottleneck is addressing (ceiling) |
+| `name_transport` | name-token **position** | 81.7% | name-embedding key → learned selective binding (slot-acc 0→100%, readCue 4× readRec) |
+| `name_lookback` (Step 2) | *none* — name location learned | **74.2%** | learned locator finds the governing name itself (locObj/locRec ~92–95%) |
+| `content_addr_A` (Step 3) | *none* — hash scaffold dropped | **74.2%** | slot addressing **self-organizes by content** (slotAgree 0→79%, no collapse) |
+
+The final arm learns selective binding end-to-end with **no oracle**, needing only two supervisions (find the name, point retrieval at the source) — the slot addressing is emergent. It closes ~74% of the chance→oracle gap (53% → 74% of the way to 98%) while the addressing self-organizes rather than memorizing an arbitrary index. Remaining frontier: **localization robustness** as the number of simultaneous names approaches the slot count *S* = 32 (a k-sweep shows 2AFC and locator accuracy fall in lockstep past ~4 names).
+
+---
+
+## Off-Template Robustness — where the chain still breaks
+
+The finished chain (`content_addr_A`) was stress-tested on inputs progressively further from the training templates (eval-only, held-out nouns throughout; template base ≈ 68–74% 2AFC):
+
+| Tier | Change | Result | Diagnosis |
+|------|--------|--------|-----------|
+| T1 | new verbs / frames | top5 62%→35%, **2AFC holds ~69%** | **selection generalizes, EMIT does not** |
+| T2 | cleft / inversion / shuffle | locObj 88%→44%, 2AFC → chance | locator overfits **position**, not syntax |
+| T3 | pronoun cue | locRec 97%→4% | **no coreference mechanism** exists |
+| T4 | natural TinyStories | 2AFC 36% (below chance) | compound floor — copies recent noun |
+
+### What actually collapses at T1 (emit decomposition)
+
+The mem-copy readout is `gate λ → read → decode → mix`. Decomposing the T1 failure isolates the culprit to **one stage**:
+
+- **DECODE is fine off-template.** Given a concentrated read, copy-top5 = **100%** on both template and T1; an oracle one-hot read yields P_copy top5 = **100% on held-out T1**. Identity is *not* destroyed in the value/emit path.
+- **The GATE is the failure.** Failure cross-tab (65 fails): **GATE 91%, READ 9%, DECODE 0%, MIX 0%**. The copy gate `λ = σ(copy_gate(x))` keys on **surface familiarity** — a *generalization gradient* (G0→G5 novelty ladder) shows λ climbs 0.49→0.83 breaking at the **first** novel word, so the copy branch gets down-weighted out of top5. The locator, by contrast, is a **cliff**: lexicon-invariant (flat through novel adjectives/verbs) until intro *frames* change.
+
+### The gate fix (necessary, not sufficient)
+
+Re-sourcing the gate from **read-concentration statistics** instead of raw `x` (`--conc_gate stats`) makes λ **lexicon-invariant** (flat 0.64→0.67 across the gradient vs 0.49→0.83) with **no template regression** (held-out 2AFC 78% > 74.2%). But T1 emit did **not** recover (34% ≈ 35%): fixing the gate simply **moved the bottleneck** to the untouched **read-addressing leak** (readCue still 0.66→0.24) and the **locator cliff**. A `stats+x` control re-climbs to 0.83, confirming the raw-`x` features are what make the gate lexically brittle.
+
+**Net:** off-template, the copy readout and identity decode are intact; the surface-overfit components are the **gate** (fixable, done) and the **read query / locator** (the current frontier).
+
+---
+
 ## The bfloat16 Master-Weight Bug
 
 Early training called `model.to(torch.bfloat16)`, storing all parameters as bf16 master weights. This silently froze every RMSNorm layer for the entire run.
@@ -332,7 +401,7 @@ Community reimplementations of TinyStories at comparable parameter counts, but w
 
 Spider Web SLM is a **proof of concept and a work in progress**, not a competitive language model. It is being actively developed with the goal of improving its capabilities over time.
 
-In its current state it demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a fixed-size sequential context store. Its main *research* contribution is the binding investigation above: by building the non-attention alternative and instrumenting exactly where it breaks, it gives a constructive, measured account of what attention supplies natively — a content-agnostic, identity-preserving copy at both the routing and the output stage — that an averaging-based substrate structurally lacks, and then **closes the loop** by adding that primitive back as a pointer/copy readout and showing, with a held-out battery, that the repaired substrate binds (89% top-5 emit on unseen entities) *and* models language (CE 3.6) simultaneously. The next step is to show this integrated binding supports downstream *reasoning* (multi-hop attribute recall, state tracking), not just single-entity re-emission.
+In its current state it demonstrates that Lorenz-63 chaos dynamics can be used as a trainable routing mechanism without divergence, and that SRM provides a fixed-size sequential context store. Its main *research* contribution is the binding investigation above: by building the non-attention alternative and instrumenting exactly where it breaks, it gives a constructive, measured account of what attention supplies natively — a content-agnostic, identity-preserving copy at both the routing and the output stage — that an averaging-based substrate structurally lacks, and then **closes the loop** by adding that primitive back as a pointer/copy readout and showing, with a held-out battery, that the repaired substrate binds (89% top-5 emit on unseen entities) *and* models language (CE 3.6) simultaneously. It then pushes past single-entity re-emission to **multi-entity selection**: an oracle probe localizes the remaining break to *addressing* (not value/emit), and a learned subject-resolving binder removes the oracle in stages to reach held-out 2AFC 74% (chance 53%) with slot addressing that self-organizes by content. Off-template stress tests then bound the claim honestly — selection and identity-decode generalize, but the copy **gate** and name **locator** overfit surface form; a read-statistics gate fixes the gate half and shifts the frontier to the read-addressing leak. The next step is downstream *reasoning* (multi-hop attribute recall, state tracking) and off-template robustness of the locator, not just re-emission.
 
 The fair parameter-matched scaling test (above) shows that SRM's theoretical O(1) memory advantage does not yet translate into a practical advantage at the tested sequence lengths — both architectures grow at similar rates up to 2048 tokens. A real advantage would require much longer contexts than those tested, and would need to be weighed against the 65–149× throughput deficit from the serial hop loop.
 
