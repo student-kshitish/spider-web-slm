@@ -293,8 +293,11 @@ def main():
     allnouns = set(M.single_tok(sp, TA.OBJECTS + vocab["train"] + vocab["test"]))
     print(f"[offtmpl] held-out single-tok nouns={len(held)}  seed={SEED}  N~{N}/tier")
 
-    CKPTS = [("content_addr_A", "checkpoints/content_addr_A/best.pt"),
-             ("name_lookback",  "checkpoints/name_lookback/best.pt")]
+    # default: content_addr_A (all tiers) + name_lookback (T1 ref). An optional argv
+    # overrides the PRIMARY checkpoint (all tiers) — e.g. a conc_gate variant.
+    primary = (sys.argv[1] if len(sys.argv) > 1 else "checkpoints/content_addr_A/best.pt")
+    pname = primary.split("/")[-2] if "/" in primary else primary
+    CKPTS = [(pname, primary), ("name_lookback", "checkpoints/name_lookback/best.pt")]
 
     # build the per-tier item lists ONCE (deterministic), shared across checkpoints
     tiers = [
@@ -324,7 +327,7 @@ def main():
         print(f"      target={c!r}   recency-distractor={r!r}")
 
     # ── run each checkpoint; combined table ──────────────────────────────────────
-    for cname, path in CKPTS:
+    for ci, (cname, path) in enumerate(CKPTS):
         P.CKPT = path
         M.CKPT = path
         M.P.CKPT = path
@@ -343,9 +346,9 @@ def main():
                          oracle=False, name_transport=False, name_lookback=nlook)
         bc1, bc5, br1, bafc, bmc, bmr, blo, blr, bn = base
 
-        # which tiers to run for this checkpoint: all four for content_addr_A;
-        # Tier 1 only for name_lookback (comparison), per spec.
-        run = tiers if cname == "content_addr_A" else tiers[:1]
+        # which tiers to run: all four for the PRIMARY checkpoint (index 0);
+        # Tier 1 only for the name_lookback comparison row, per spec.
+        run = tiers if ci == 0 else tiers[:1]
 
         print("\n" + "=" * 96)
         print(f"CHECKPOINT: {cname}  ({path})   ema_ce={ema:.4f}  "

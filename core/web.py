@@ -40,6 +40,16 @@ class SpiderWeb(nn.Module):
         # at warm-start (gate starts active, free to move either way, not collapsed).
         self.copy_gate = nn.Linear(self.d, 1)
         nn.init.zeros_(self.copy_gate.bias)
+        # ── conc_gate (bounded experiment): re-source the gate from READ-CONCENTRATION
+        # stats [read_max, read_entropy] (lexicon-invariant) instead of / plus x. Only
+        # built when config.model.conc_gate in {"stats","stats_x"}; zero-bias so lambda
+        # starts neutral. copy_gate above stays as the "off" path. See config.py.
+        self._conc_gate = getattr(config.model, "conc_gate", "off")
+        if self._conc_gate in ("stats", "stats_x"):
+            in_dim = 2 + (self.d if self._conc_gate == "stats_x" else 0)
+            self.conc_gate = nn.Linear(in_dim, 1)
+            nn.init.zeros_(self.conc_gate.weight)   # neutral lambda~0.5 at warm-start
+            nn.init.zeros_(self.conc_gate.bias)
 
         # ── Radial hierarchy: inner-ring entity recall ───────────────────────
         # Projects the mean inner-ring memory slot back to embedding space so
@@ -456,7 +466,21 @@ class SpiderWeb(nn.Module):
                 P_copy.scatter_add_(2, src_ids, copy_attn)                # (B,T,V), sums to 1
 
             # learned copy gate: lambda weights generative, (1-lambda) weights copy.
-            lam = torch.sigmoid(self.copy_gate(x).float()).squeeze(-1)    # (B,T)
+            # conc_gate: re-source lambda from the copy distribution's CONCENTRATION
+            # (read_max, read_entropy) — lexicon-invariant, unlike copy_gate(x). Stats
+            # are taken from copy_attn (the on-graph distribution feeding the copy), so
+            # gradient from L_router reaches conc_gate's weights (and the read).
+            gate_feats = None
+            if self._conc_gate in ("stats", "stats_x"):
+                ca = copy_attn.float().clamp_min(1e-9)               # (B,T,u)
+                read_max = ca.max(dim=-1).values                    # (B,T)
+                read_ent = -(ca * ca.log()).sum(dim=-1)             # (B,T)
+                gate_feats = torch.stack([read_max, read_ent], dim=-1)  # (B,T,2)
+                if self._conc_gate == "stats_x":
+                    gate_feats = torch.cat([gate_feats, x.float()], dim=-1)  # (B,T,2+d)
+                lam = torch.sigmoid(self.conc_gate(gate_feats).float()).squeeze(-1)
+            else:
+                lam = torch.sigmoid(self.copy_gate(x).float()).squeeze(-1)    # (B,T)
             # FIX B (pointer_lambda_floor): affine-remap lam into [floor, 1] so the
             # generative branch always keeps gradient and the gate can't fully
             # collapse onto copy. Keeps gradient everywhere (unlike a hard clamp).
@@ -475,6 +499,8 @@ class SpiderWeb(nn.Module):
                 "lambda_mean":     float(lam.detach().mean()),
                 "lambda_frac_gen": float((lam.detach() > 0.5).float().mean()),
                 "copy_mass_mean":  float((1.0 - lam.detach()).mean()),
+                "gate_src":        self._conc_gate,   # "off" | "stats" | "stats_x"
+                "gate_feats":      gate_feats,        # (B,T,2[+d]) conc-gate input, or None
             }
 
         # normalise accumulated losses by the number of contributing ring/hops

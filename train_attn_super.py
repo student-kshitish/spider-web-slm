@@ -58,7 +58,8 @@ TS_PATH    = "data/raw/tinystories.txt"
 PAD_ID     = 0
 IGNORE     = -1                      # SpiderWebLoss CE ignore_index
 NEW_PREFIXES = ("hybrid_lookback", "separable_mem", "query_read",
-                "struct_read", "recall_proj", "copy_gate", "name_lookback")
+                "struct_read", "recall_proj", "copy_gate", "name_lookback",
+                "conc_gate")
 
 # ── synthetic binding vocabulary (superset; probe tests ball/hat/key/car) ──
 OBJECTS = ["ball","hat","cat","dog","book","cup","kite","doll","box","drum",
@@ -96,7 +97,7 @@ def ft_config(batch_size, slots, steps, use_pointer=False,
               warm_gen=False, lambda_floor=0.0, mem_copy=False,
               mem_copy_scale=12.0, write_mode="blend", no_meanpool=False,
               oracle_bind=False, id_key=False, name_transport=False,
-              name_lookback=False) -> Config:
+              name_lookback=False, conc_gate="off") -> Config:
     return Config(
         model=ModelConfig(dim=64, hidden_dim=256, num_rings=4, nodes_per_ring=8,
                           vocab_size=5000, max_seq_len=256,
@@ -111,7 +112,8 @@ def ft_config(batch_size, slots, steps, use_pointer=False,
                           oracle_bind=oracle_bind,                     # subject-keyed oracle
                           id_key_addr=id_key,                          # identity-key addressing
                           name_transport=name_transport,               # name-transport key oracle
-                          name_lookback=name_lookback),                # Step 2: learned name locator
+                          name_lookback=name_lookback,                 # Step 2: learned name locator
+                          conc_gate=conc_gate),                        # gate input: off|stats|stats_x
         memory=MemoryConfig(slots=slots, alpha=0.9, beta=0.1, write_mode=write_mode),
         lorenz=LorenzConfig(),
         routing=RoutingConfig(temp_start=0.3, temp_end=0.1,
@@ -447,7 +449,8 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
         warm_gen=False, lambda_floor=0.0, w_router=0.0, p_bind=None,
         mem_copy=False, multi_entity=False, oracle_bind=False,
         w_addr=0.0, id_key=False, oracle_anneal=False, name_transport=False,
-        name_lookback=False, w_name=0.0, content_addr=False, w_entropy=0.0):
+        name_lookback=False, w_name=0.0, content_addr=False, w_entropy=0.0,
+        conc_gate="off"):
     torch.manual_seed(42); random.seed(123)
     global P_BIND, MULTI_ENTITY
     if p_bind is not None:
@@ -483,7 +486,7 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
                     mem_copy=mem_copy, write_mode=write_mode,
                     no_meanpool=no_meanpool, oracle_bind=oracle_bind,
                     id_key=id_key, name_transport=name_transport,
-                    name_lookback=name_lookback)
+                    name_lookback=name_lookback, conc_gate=conc_gate)
     start_step = int(ckpt.get("step", 0)) if resume else 0
 
     model = SpiderWeb(cfg).to(device)
@@ -496,6 +499,13 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
           f"{'RESUME '+ckpt_path if resume else 'WARM from '+base_ckpt}", flush=True)
     print(f"[as] INTEGRATION: warm_gen={warm_gen} lambda_floor={lambda_floor} "
           f"w_router={w_router} p_bind={P_BIND}", flush=True)
+    print(f"[as] CONC_GATE={conc_gate} "
+          + ("(copy gate lambda = sigmoid(conc_gate("
+             + ("[read_max, read_entropy]))" if conc_gate == "stats"
+                else "[read_max, read_entropy, x]))" if conc_gate == "stats_x" else "x)) DEFAULT")
+             + "; gate input is read-concentration — lexicon-invariant)"
+             if conc_gate in ("stats", "stats_x")
+             else "(default gate: lambda = sigmoid(copy_gate(x)))"), flush=True)
     print(f"[as] MEM_COPY={mem_copy} (copy source = "
           f"{'orbital memory read_dist + embed-similarity emit' if mem_copy else 'hybrid attn scatter'}"
           f"; write_mode={write_mode} no_meanpool={no_meanpool})", flush=True)
@@ -587,7 +597,8 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
                     "oracle_anneal": oracle_anneal,
                     "name_transport": name_transport,
                     "name_lookback": name_lookback, "w_name": w_name,
-                    "content_addr": content_addr, "w_entropy": w_entropy}, path)
+                    "content_addr": content_addr, "w_entropy": w_entropy,
+                    "conc_gate": conc_gate}, path)
 
     print(f"[as] {'Step':>6} {'CE':>8} {'EMA':>8} {'genCE':>7} {'attnL':>7} "
           f"{'mass':>6} {'lam':>6} {'lamRcl':>6} {'rout':>6} {'tau':>5} | "
@@ -793,6 +804,11 @@ def main():
     ap.add_argument("--w_entropy", type=float, default=0.0,
                     help="Step 3 optional sharpener (e.g. 0.01): penalize routing entropy for "
                          "confident slot choice WITHOUT dictating which slot. Only with --content_addr.")
+    ap.add_argument("--conc_gate", type=str, default="off",
+                    choices=["off", "stats", "stats_x"],
+                    help="re-source the copy gate lambda from read-concentration stats "
+                         "[read_max, read_entropy] ('stats') or those + x ('stats_x') instead "
+                         "of copy_gate(x) ('off'). Lexicon-invariant gate input; floor still applies.")
     a = ap.parse_args()
     for bs in (48, 32, 24, 16):
         try:
@@ -805,7 +821,8 @@ def main():
                 oracle_anneal=a.oracle_anneal,
                 name_transport=a.name_transport,
                 name_lookback=a.name_lookback, w_name=a.w_name,
-                content_addr=a.content_addr, w_entropy=a.w_entropy); return
+                content_addr=a.content_addr, w_entropy=a.w_entropy,
+                conc_gate=a.conc_gate); return
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             print(f"[as] OOM at batch={bs}, falling back.", flush=True)

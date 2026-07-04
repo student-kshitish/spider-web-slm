@@ -46,6 +46,19 @@ class ModelConfig:
     # engine. mem_copy_scale sharpens the cosine-similarity emit softmax.
     mem_copy: bool = False
     mem_copy_scale: float = 12.0
+    # ── conc_gate: re-source the copy gate from READ-CONCENTRATION statistics ────
+    # The generalization probe showed the default gate copy_gate(x) degrades with
+    # lexical familiarity (lambda 0.49->0.83 from one novel word) because x carries
+    # token-shaped features. Read-concentration (how peaked the copy distribution
+    # copy_attn is) is lexicon-invariant and is the true correlate of copy success
+    # (P_copy top-5 = 100% whenever read mass > 0.5). This flag conditions lambda on
+    # [read_max, read_entropy] instead of / in addition to x. Values:
+    #   "off"     : default gate, lambda = sigmoid(copy_gate(x))            (unchanged)
+    #   "stats"   : lambda = sigmoid(conc_gate([read_max, read_entropy]))   (2-dim in)
+    #   "stats_x" : lambda = sigmoid(conc_gate([read_max, read_entropy, x])) (2+d in)
+    # Only meaningful with use_pointer; stats are taken from the copy distribution
+    # (mem_copy: read_dist; else the hybrid attn map). The lambda floor still applies.
+    conc_gate: str = "off"
     # ── Substrate fixes (diagnosed by probe_binding_linear.py) ──────────────────
     # Each isolates one cause of the bound entity being destroyed before the
     # recall position. All default OFF so existing checkpoints are unaffected.

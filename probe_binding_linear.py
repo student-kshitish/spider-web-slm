@@ -136,7 +136,8 @@ def load_model():
     model = SpiderWeb(cfg).to(device)
     miss, unexp = model.load_state_dict(state, strict=False)
     new_pref = ("hybrid_lookback", "separable_mem", "query_read",
-                "struct_read", "recall_proj", "copy_gate", "name_lookback")
+                "struct_read", "recall_proj", "copy_gate", "name_lookback",
+                "conc_gate")
     bad = [k for k in miss if not k.startswith(new_pref)]
     assert not bad and not unexp, f"load mismatch: missing={bad} unexpected={unexp}"
     print(f"[probe] arch flags: sharp_head={cfg.model.sharp_head} "
