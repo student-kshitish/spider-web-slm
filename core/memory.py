@@ -428,12 +428,22 @@ class SeparableMemoryRead(nn.Module):
         self.out_gate  = nn.Linear(d, d, bias=True)
         self.route_temp = 0.5                           # <1 sharpens slot routing
 
+        # ── Step 6 write policies (config-gated; no-op defaults) ────────────────
+        self.write_decay = float(getattr(config.model, "write_decay", 1.0))  # γ (1=off)
+        self.erase       = bool(getattr(config.model, "erase", False))
+        if self.erase:
+            # learned erase gate e = sigmoid(erase_gate(x)); zero weight + very
+            # negative bias -> e ~ 0 at warm-start (erase OFF, warm-compatible).
+            self.erase_gate = nn.Linear(d, 1)
+            nn.init.zeros_(self.erase_gate.weight)
+            nn.init.constant_(self.erase_gate.bias, -6.0)
+
         # identity init -> warm-start CE == baseline; training opens it up
         nn.init.zeros_(self.o_proj.weight)
         nn.init.constant_(self.out_gate.bias, -4.0)
 
     def forward(self, x, causal=True, subj_id=None, oracle_bind=False,
-                id_key=None, oracle_alpha=1.0):
+                id_key=None, oracle_alpha=1.0, giver_key_in=None):
         """x: (B,T,d) -> (x_out (B,T,d), stats dict).
 
         id_key (identity-key addressing): when provided (B,T,d), the slot
@@ -473,9 +483,44 @@ class SeparableMemoryRead(nn.Module):
         gate   = torch.sigmoid(self.gate_mlp(x)).squeeze(-1)                 # (B,T)
         values = self.value(x)                                              # (B,T,d)
 
-        # slot-routing agreement C[t,u] = read_w[t] . write_w[u]  in [0,1]
-        C = torch.einsum("bts,bus->btu", read_w, write_w)                   # (B,T,T)
-        W = C * gate.unsqueeze(1)                                           # weight by writer gate
+        # per-position write STRENGTH to each slot: a[u,s] = write_w[u,s] * gate[u]
+        a = write_w * gate.unsqueeze(-1)                                    # (B,T,S)
+
+        gamma = self.write_decay
+        erase_on = self.erase and giver_key_in is not None
+        if gamma >= 1.0 and not erase_on:
+            # ── Step-5 (additive) path: exact, no decay / no erase ──────────────
+            # slot-routing agreement C[t,u] = read_w[t] . write_w[u]  in [0,1]
+            C = torch.einsum("bts,bus->btu", read_w, write_w)               # (B,T,T)
+            W = C * gate.unsqueeze(1)                                       # weight by writer gate
+            erase_stats = None
+        else:
+            # ── Step-6 (decayed / erased) path ──────────────────────────────────
+            # An explicit decayed slot memory M_s(t) = Σ_{u<=t} a[u,s] value[u] ·
+            # Π_{u<v<=t} D[v,s] read as retrieved[t]=Σ_s read_w[t,s] M_s(t) has the
+            # EXACT closed form  W'[t,u] = Σ_s read_w[t,s]·a[u,s]·exp(L[t,s]-L[u,s])
+            # with  L[t,s] = Σ_{v<=t} log D[v,s]  the cumulative log-decay. γ=1 &
+            # erase off -> D=1, L=0 -> W'==C·gate (identical to the path above), so
+            # this is a strict generalization that keeps the per-position read_dist.
+            logD = torch.zeros(B, T, self.S, device=x.device, dtype=torch.float32)
+            if gamma < 1.0:                                                 # DECAY-ON-WRITE
+                logD = logD + torch.log((1.0 - (1.0 - gamma) * a).clamp_min(1e-6))
+            erase_stats = None
+            if erase_on:                                                   # TARGETED ERASE
+                # giver slot address from the SECOND lookback's name key; e is the
+                # learned erase gate (zero-init -> ~0). slot <- slot*(1 - e*w_giver)
+                # is one extra decay event per position, folded into logD.
+                gk = self.write_key(giver_key_in)                          # reuse write-routing
+                w_giver = torch.softmax((gk @ self.slot_addr.t()) / scale, dim=-1)  # (B,T,S)
+                e = torch.sigmoid(self.erase_gate(x)).squeeze(-1)          # (B,T) in (0,1)
+                logD = logD + torch.log((1.0 - e.unsqueeze(-1) * w_giver).clamp_min(1e-6))
+                erase_stats = {"e": e, "w_giver": w_giver}
+            L = torch.cumsum(logD, dim=1).clamp_min(-60.0)                 # (B,T,S), <=0
+            RT = read_w * torch.exp(L)                                     # read side  @ t
+            AU = a * torch.exp(-L)                                         # write side @ u
+            W = torch.einsum("bts,bus->btu", RT, AU)                       # (B,T,T) = W'
+            # gate is already folded into a (hence W); no separate ·gate needed.
+
         if causal:
             mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
             W = W.masked_fill(~mask.unsqueeze(0), 0.0)
@@ -486,6 +531,7 @@ class SeparableMemoryRead(nn.Module):
         # memory's OWN content-addressed read over source positions — kept on the
         # autograd graph so it can both (a) feed a memory-sourced copy and (b) be
         # supervised toward recall->source (the RETRIEVE link). NOT an attn map.
+        # Under Step-6 policies W already carries per-write decay + giver-slot erase.
         read_dist = W / denom                                               # (B,T,T)
         retrieved = torch.einsum("btu,bud->btd", read_dist, values)         # (B,T,d)
 
@@ -503,4 +549,7 @@ class SeparableMemoryRead(nn.Module):
         stats["read_dist"] = read_dist          # (B,T,T) on-graph: memory read
         stats["write_w"]   = write_w            # (B,T,S) on-graph: slot routing (write) — L_addr target
         stats["read_w"]    = read_w             # (B,T,S) on-graph: slot routing (read)  — L_addr target
+        if erase_stats is not None:             # Step 6: erase gate e + giver address (on-graph)
+            stats["erase_e"]  = erase_stats["e"]        # (B,T)
+            stats["w_giver"]  = erase_stats["w_giver"]  # (B,T,S)
         return x_out, stats

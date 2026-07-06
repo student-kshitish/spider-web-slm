@@ -59,7 +59,7 @@ PAD_ID     = 0
 IGNORE     = -1                      # SpiderWebLoss CE ignore_index
 NEW_PREFIXES = ("hybrid_lookback", "separable_mem", "query_read",
                 "struct_read", "recall_proj", "copy_gate", "name_lookback",
-                "conc_gate")
+                "conc_gate", "giver_lookback")
 
 # ── synthetic binding vocabulary (superset; probe tests ball/hat/key/car) ──
 OBJECTS = ["ball","hat","cat","dog","book","cup","kite","doll","box","drum",
@@ -92,12 +92,50 @@ N_ENTITIES_CHOICES  = [2, 3]
 MULTI_RECALL = ["Then {name} {verb} the {obj}", "{name} wanted the {obj}",
                 "At last {name} {verb} the {obj}", "Later {name} {verb} the {obj}"]
 
+# ── Step 5: binding UPDATE / ownership TRANSFER (state tracking) ─────────────────
+# Toggled by --transfer (implies --multi_entity). ~50% of binding examples add a
+# transfer clause that RE-BINDS the giver's object to the RECIPIENT; the other
+# ~50% are structurally-identical NO-TRANSFER controls (same intro/recall
+# templates, transfer clause omitted) so the model can't assume every story
+# transfers.
+#
+# DISAMBIGUATION (the recipient, not the giver) — the reason the frames are
+# constrained. The name-lookback attention a[t,u] is strictly BACKWARD (u < t), so
+# at the transfer-WRITE position (the object token, whose value encodes the object)
+# it can resolve a name only if that name PRECEDES the object. The prepositional
+# dative "X gave the OBJ to Y" puts the recipient Y *after* OBJ, so the backward
+# lookback would resolve the GIVER and key the object to the giver's slot — the
+# exact OPPOSITE of a transfer. That frame is therefore DELIBERATELY EXCLUDED.
+# Every frame below has the RECIPIENT as the last name before {obj}, so
+# _name_pos_before(obj) returns the recipient — verified by tokenization:
+#   "Tom took the ball from Lily." -> names before ball = [Tom]            -> Tom
+#   "Lily gave Tom the ball."      -> names before ball = [Lily, Tom]      -> Tom
+TRANSFER             = False
+TRANSFER_FRAC        = 0.35     # Step 6: fraction of binding examples that transfer
+                               #   (lower than Step-5's 0.5 to guard plain-binding regression)
+TRANSFER_INTRO  = ["{name} had a {attr} {obj}.", "{name} had a {obj}.",
+                   "{name} owned a {attr} {obj}."]
+# Step 6: the GIVER holds TWO objects and transfers ONE. This makes BOTH policies
+# supervisable: old-owner recall targets the KEPT object (forces suppression of the
+# transferred binding -> ERASE), new-owner recall targets the TRANSFERRED object
+# (forces recency over the recipient's own object -> DECAY).
+TWO_OBJ_INTRO   = ["{name} had a {attrA} {objA} and a {attrB} {objB}.",
+                   "{name} had a {objA} and a {objB}.",
+                   "{name} owned a {attrA} {objA} and a {attrB} {objB}."]
+TRANSFER_FRAMES = ["{recip} took the {obj} from {giver}.",
+                   "{recip} got the {obj} from {giver}.",
+                   "{giver} gave {recip} the {obj}.",
+                   "{giver} handed {recip} the {obj}."]
+TRANSFER_RECALL = ["Then {name} {verb} the {obj}", "{name} wanted the {obj}",
+                   "Later {name} held the {obj}", "At last {name} {verb} the {obj}"]
+
 
 def ft_config(batch_size, slots, steps, use_pointer=False,
               warm_gen=False, lambda_floor=0.0, mem_copy=False,
               mem_copy_scale=12.0, write_mode="blend", no_meanpool=False,
               oracle_bind=False, id_key=False, name_transport=False,
-              name_lookback=False, conc_gate="off") -> Config:
+              name_lookback=False, conc_gate="off",
+              write_decay=1.0, erase=False) -> Config:
     return Config(
         model=ModelConfig(dim=64, hidden_dim=256, num_rings=4, nodes_per_ring=8,
                           vocab_size=5000, max_seq_len=256,
@@ -113,7 +151,9 @@ def ft_config(batch_size, slots, steps, use_pointer=False,
                           id_key_addr=id_key,                          # identity-key addressing
                           name_transport=name_transport,               # name-transport key oracle
                           name_lookback=name_lookback,                 # Step 2: learned name locator
-                          conc_gate=conc_gate),                        # gate input: off|stats|stats_x
+                          conc_gate=conc_gate,                         # gate input: off|stats|stats_x
+                          write_decay=write_decay,                     # Step 6: decay-on-write (recency)
+                          erase=erase),                                # Step 6: NTM-style targeted erase
         memory=MemoryConfig(slots=slots, alpha=0.9, beta=0.1, write_mode=write_mode),
         lorenz=LorenzConfig(),
         routing=RoutingConfig(temp_start=0.3, temp_end=0.1,
@@ -141,12 +181,14 @@ class StructuredMix(Dataset):
     def __len__(self):
         return self.n
 
-    def _pad(self, inp, tgt, recall_pos, source_pos, is_bind, subj=None, name_src=None):
+    def _pad(self, inp, tgt, recall_pos, source_pos, is_bind, subj=None,
+             name_src=None, giver_src=None):
         L = len(inp)
         x = torch.full((T_LEN,), PAD_ID, dtype=torch.long)
         y = torch.full((T_LEN,), IGNORE, dtype=torch.long)
         s = torch.full((T_LEN,), -1, dtype=torch.long)         # oracle subject ids (-1 = none)
         ns = torch.full((T_LEN,), -1, dtype=torch.long)        # name-transport source positions (-1 = default key)
+        gs = torch.full((T_LEN,), -1, dtype=torch.long)        # Step 6: giver-lookback targets (-1 = none)
         x[:L] = torch.tensor(inp, dtype=torch.long)
         y[:L] = torch.tensor(tgt, dtype=torch.long)
         if subj is not None:                                   # {position: subject_token_id}
@@ -157,7 +199,11 @@ class StructuredMix(Dataset):
             for p, npos in name_src.items():
                 if 0 <= p < T_LEN and 0 <= npos < T_LEN:
                     ns[p] = npos
-        return x, y, recall_pos, source_pos, is_bind, s, ns
+        if giver_src is not None:                              # {position: giver_token_position}
+            for p, gpos in giver_src.items():
+                if 0 <= p < T_LEN and 0 <= gpos < T_LEN:
+                    gs[p] = gpos
+        return x, y, recall_pos, source_pos, is_bind, s, ns, gs
 
     def _binding(self):
         r = self.rng
@@ -267,6 +313,229 @@ class StructuredMix(Dataset):
                 return self._pad(inp, tgt, recall_pos, source_pos, 1, subj, name_src)
         return self._binding_minimal()
 
+    # ── Step 5 helpers ──────────────────────────────────────────────────────────
+    def _name_pos_before(self, pcs, nm, before):
+        """Position of NAME's first sub-piece (e.g. '▁Lily'/'▁Tom') occurring
+        immediately before `before`. Lifted from _binding_multi's nested helper so
+        the transfer path can reuse the exact same name-localization labeling."""
+        fp = self.sp.encode(nm, out_type=str)[0]
+        cand = [j for j, p in enumerate(pcs) if p == fp and j < before]
+        return cand[-1] if cand else None
+
+    def build_transfer_item(self, rng, objs, cue_mode, do_transfer, k,
+                            for_training=True):
+        """Step 6 two-object-giver transfer story + every label decay/erase need.
+
+        Ownership model: subject 0 = GIVER, holding TWO objects (objT transferred,
+        objK KEPT); subject 1 = RECIPIENT (owns objC); subject 2 = NON-involved
+        (k=3). After the transfer the recipient holds objC + objT. cue_mode picks
+        the recall subject and its SUPERVISED correct object:
+          new         -> recipient : objT (TRANSFERRED) — forces recency over objC
+          old         -> giver     : objK (KEPT)        — forces suppression of objT
+          noninvolved -> subject 2 : objD               — interference control
+          plain (do_transfer=False): random cue, its own object — no-transfer ctrl
+        old-owner is now a *supervised* target (its answer, the kept object, is
+        well-defined), which is what lets the erase gate learn.
+
+        Supervision (existing machinery + one second lookback):
+          * name_src[transfer_pos] = RECIPIENT  (write re-binds objT under new owner)
+          * giver_src[erase_pos]   = GIVER      (second lookback resolves the giver
+            at the transfer clause -> giver slot key for the NTM erase). The erase
+            GATE fires from x (learned), driven by the old-owner recall NLL.
+          * source_pos (L_attn): new -> transfer-write ; old -> KEPT object's intro.
+
+        Frames are recipient-before-object (Step-5 disambiguation kept). erase_pos =
+        the giver's occurrence IN the transfer clause (last giver before the recall
+        clause), so the backward giver-lookback can reach it even when the giver is
+        also the recall cue.
+
+        for_training=True -> recall ends in the object (LM/L_attn target).
+        for_training=False -> recall ends at 'the' (open eval prompt). Returns a
+        dict, or None on bad tokenization (caller resamples)."""
+        sp = self.sp
+        n_obj = k + 1                                     # giver needs TWO objects
+        if len(objs) < n_obj or len(FEMALE) + len(MALE) < k:
+            return None
+        names = rng.sample(FEMALE + MALE, k)
+        chos  = rng.sample(objs, n_obj)
+        prons = [("she", "She") if nm in FEMALE else ("he", "He") for nm in names]
+        giver, recip = names[0], names[1]
+        objA, objB = chos[0], chos[1]                     # giver's two objects
+        recip_obj  = chos[2]
+        non_name   = names[2] if k >= 3 else None
+        non_obj    = chos[3] if k >= 3 else None
+        t_idx = rng.randint(0, 1)                         # which of giver's two moves
+        objT = objA if t_idx == 0 else objB               # TRANSFERRED
+        objK = objB if t_idx == 0 else objA               # KEPT
+
+        parts = []
+        parts.append(rng.choice(TWO_OBJ_INTRO).format(
+            name=giver, attrA=rng.choice(ATTRS), objA=objA,
+            attrB=rng.choice(ATTRS), objB=objB))
+        parts.append(rng.choice(TRANSFER_INTRO).format(
+            name=recip, attr=rng.choice(ATTRS), obj=recip_obj))
+        if k >= 3:
+            parts.append(rng.choice(TRANSFER_INTRO).format(
+                name=non_name, attr=rng.choice(ATTRS), obj=non_obj))
+        if rng.random() < 0.3:
+            parts.append(rng.choice(FILLER).format(pron=prons[0][0], Pron=prons[0][1]))
+        if do_transfer:                                  # the ownership UPDATE
+            parts.append(rng.choice(TRANSFER_FRAMES).format(
+                recip=recip, giver=giver, obj=objT))
+        if rng.random() < 0.25:
+            parts.append(rng.choice(FILLER).format(pron=prons[1][0], Pron=prons[1][1]))
+
+        # recall cue + SUPERVISED correct object
+        if not do_transfer:
+            ci = rng.randrange(k)
+            cue_name = names[ci]
+            cue_obj  = objB if ci == 0 else (recip_obj if ci == 1 else non_obj)
+            cmode = "plain"
+        elif cue_mode == "new":
+            cue_name, cue_obj, cmode = recip, objT, "new"
+        elif cue_mode == "old":
+            cue_name, cue_obj, cmode = giver, objK, "old"
+        elif cue_mode == "noninvolved":
+            if k < 3:
+                return None
+            cue_name, cue_obj, cmode = non_name, non_obj, "noninvolved"
+        else:
+            return None
+
+        verb = rng.choice(VERBS)
+        prefix_text = " ".join(parts)                    # everything before the recall
+        if for_training:
+            parts.append(rng.choice(TRANSFER_RECALL).format(
+                name=cue_name, verb=verb, obj=cue_obj))
+        else:
+            parts.append("Then {name} {verb} the".format(name=cue_name, verb=verb))
+
+        text = " ".join(parts)
+        pcs  = sp.encode(text, out_type=str)
+        ids  = sp.EncodeAsIds(text)
+        n_prefix = len(sp.encode(prefix_text, out_type=str))   # recall-clause boundary
+
+        def occ(w):
+            wl = w.lower()
+            return [i for i, p in enumerate(pcs) if p.replace("▁", "").lower() == wl]
+
+        occT, occK = occ(objT), occ(objK)
+        if not occT or not occK:
+            return None
+        intro_T_pos = occT[0]                                   # objT's giver intro
+        intro_K_pos = occK[0]                                   # objK's giver intro (KEPT source)
+        transfer_pos = occT[1] if (do_transfer and len(occT) >= 2) else None
+        if do_transfer and transfer_pos is None:
+            return None
+        recip_occ    = occ(recip_obj)
+        recip_own_pos = recip_occ[0] if recip_occ else None
+
+        # erase position = the GIVER's occurrence inside the transfer clause (last
+        # giver token strictly before the recall clause), so a backward lookback
+        # reaches it even when the giver is ALSO the recall cue (old-owner).
+        erase_pos = None
+        if do_transfer:
+            gfp = sp.encode(giver, out_type=str)[0]
+            gcand = [j for j, p in enumerate(pcs) if p == gfp and j < n_prefix]
+            erase_pos = gcand[-1] if gcand else None
+            if erase_pos is None:
+                return None
+
+        if for_training:
+            occ_c = occ(cue_obj)
+            if not occ_c or occ_c[-1] != len(ids) - 1:
+                return None                                      # cue obj must be final token
+            recall_pos = len(ids) - 2                            # the 'the' token
+            if cmode == "new":
+                source_pos = transfer_pos                        # read -> transfer-write
+            elif cmode == "old":
+                source_pos = intro_K_pos                         # read -> KEPT object intro
+            else:                                                # noninvolved / plain
+                source_pos = occ_c[0]
+            if source_pos is None or len(ids) - 1 > T_LEN or not (source_pos < recall_pos):
+                return None
+        else:
+            recall_pos = len(ids) - 1                            # 'the' (open prompt)
+            source_pos = (transfer_pos if cmode == "new"
+                          else intro_K_pos if cmode == "old" else None)
+
+        # ── name_src labels (recipient lookback; targets ONLY, never in forward) ─
+        name_src = {}
+        def set_ns(pos, nm):
+            if pos is None:
+                return
+            npos = self._name_pos_before(pcs, nm, pos)
+            if npos is not None:
+                name_src[pos] = npos
+        set_ns(intro_T_pos, giver)                               # giver's two intros
+        set_ns(intro_K_pos, giver)
+        set_ns(recip_own_pos, recip)
+        if k >= 3:
+            set_ns((occ(non_obj) or [None])[0], non_name)
+        if transfer_pos is not None:                             # transfer -> RECIPIENT
+            set_ns(transfer_pos, recip)
+        set_ns(recall_pos, cue_name)                             # recall -> cue name
+
+        # ── giver_src labels (SECOND lookback; erase key). Self-resolve the giver
+        # at the transfer clause -> name_hat = giver embedding verbatim. ──────────
+        giver_src = {}
+        if erase_pos is not None:
+            giver_src[erase_pos] = erase_pos
+
+        # ── subj labels (diagnostic under content_addr) ─────────────────────────
+        subj = {}
+        for w, nm in [(objA, giver), (objB, giver), (recip_obj, recip)] + (
+                [(non_obj, non_name)] if k >= 3 else []):
+            oi = occ(w)
+            if oi:
+                subj[oi[0]] = sp.EncodeAsIds(nm)[0]
+        if transfer_pos is not None:
+            subj[transfer_pos] = sp.EncodeAsIds(recip)[0]
+        subj[recall_pos] = sp.EncodeAsIds(cue_name)[0]
+
+        return dict(text=text, ids=ids, pcs=pcs,
+                    recall_pos=recall_pos, source_pos=source_pos,
+                    subj=subj, name_src=name_src, giver_src=giver_src,
+                    cue_mode=cmode, do_transfer=do_transfer, k=k,
+                    objT=objT, objK=objK, recip_obj=recip_obj, non_obj=non_obj,
+                    cue_obj=cue_obj, cue_name=cue_name,
+                    giver=giver, recip=recip, non_name=non_name,
+                    names=names, chos=chos,
+                    intro_T_pos=intro_T_pos, intro_K_pos=intro_K_pos,
+                    transfer_pos=transfer_pos, recip_own_pos=recip_own_pos,
+                    erase_pos=erase_pos,
+                    new_owner_pos=(name_src.get(transfer_pos)
+                                   if transfer_pos is not None else None))
+
+    def _binding_transfer(self):
+        """Step-6 training sampler: TRANSFER_FRAC transfer / rest no-transfer
+        controls. Transfer recalls cue the NEW owner, the OLD owner (now supervised
+        toward the KEPT object), or a NON-involved subject (k=3). Returns the
+        8-tuple the loop consumes (adds giver_src for the erase lookback)."""
+        r = self.rng
+        for _ in range(12):
+            do_t = r.random() < TRANSFER_FRAC
+            k = r.choice(N_ENTITIES_CHOICES)
+            if do_t:
+                u = r.random()                           # new / old / noninvolved mix
+                if k >= 3 and u < 0.25:
+                    cue_mode = "noninvolved"
+                elif u < 0.60:
+                    cue_mode = "old"                     # supervise the KEPT-object recall
+                else:
+                    cue_mode = "new"
+            else:
+                cue_mode = "plain"
+            item = self.build_transfer_item(r, OBJECTS, cue_mode, do_t, k,
+                                            for_training=True)
+            if item is None:
+                continue
+            ids = item["ids"]
+            return self._pad(ids[:-1], ids[1:], item["recall_pos"],
+                             item["source_pos"], 1, item["subj"], item["name_src"],
+                             item["giver_src"])
+        return self._binding_minimal()
+
     def _ts(self):
         b = self.rng.randrange(self.n_ts)
         s = b * (T_LEN + 1)
@@ -275,6 +544,8 @@ class StructuredMix(Dataset):
 
     def __getitem__(self, idx):
         if self.rng.random() < P_BIND:
+            if TRANSFER:
+                return self._binding_transfer()          # Step 5: ~50% transfer / ~50% control
             return self._binding_multi() if MULTI_ENTITY else self._binding()
         return self._ts()
 
@@ -343,7 +614,7 @@ def addr_supervision(out, recall_pos, subj, S):
     return loss, w_acc, r_acc, n_w, n_r
 
 
-def name_supervision(out, name_src):
+def name_supervision(out, name_src, stats_key="name_stats"):
     """L_name (Step 2) — teach the NAME-LOOKBACK where the governing name is.
 
     The lookback attention a[t] (out["name_stats"]["attn"], on-graph) is pulled by
@@ -355,11 +626,12 @@ def name_supervision(out, name_src):
 
         L_name = - mean_over_labeled(t)  log a[t, name_src[t]]
 
-    Returns (loss, realized_mass, argmax_acc, n_labeled). loss is on-graph and
-    reaches ONLY the lookback's q_proj/k_proj via a — not the value path (the raw
-    embedding, which a does not weight in this loss) nor write_key/read_query
-    (name_hat feeds them, but name_hat is absent from L_name)."""
-    ns = out.get("name_stats")
+    stats_key selects which lookback to supervise: "name_stats" (recipient/subject
+    locator, Steps 2-5) or "giver_stats" (Step-6 erase giver locator). Returns
+    (loss, realized_mass, argmax_acc, n_labeled). loss is on-graph and reaches ONLY
+    the lookback's q_proj/k_proj via a — not the value path (the raw embedding,
+    which a does not weight in this loss)."""
+    ns = out.get(stats_key)
     if ns is None or "attn" not in ns:
         z = torch.zeros((), device=name_src.device)
         return z, 0.0, 0.0, 0
@@ -450,12 +722,21 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
         mem_copy=False, multi_entity=False, oracle_bind=False,
         w_addr=0.0, id_key=False, oracle_anneal=False, name_transport=False,
         name_lookback=False, w_name=0.0, content_addr=False, w_entropy=0.0,
-        conc_gate="off"):
+        conc_gate="off", transfer=False,
+        write_decay=1.0, erase=False, transfer_frac=None):
     torch.manual_seed(42); random.seed(123)
-    global P_BIND, MULTI_ENTITY
+    global P_BIND, MULTI_ENTITY, TRANSFER, TRANSFER_FRAC
     if p_bind is not None:
         P_BIND = p_bind                              # FIX D: rebalance bind vs LM mass
+    # Step 6 write policies imply the transfer data (they act on the transfer clause)
+    if erase or write_decay < 1.0:
+        transfer = True
+    if transfer:
+        multi_entity = True                          # transfer needs named subjects
+    if transfer_frac is not None:
+        TRANSFER_FRAC = transfer_frac                # Step 6: guard plain-binding regression
     MULTI_ENTITY = multi_entity                      # multi-entity selective binding
+    TRANSFER = transfer                              # Step 5/6: ownership UPDATE data
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # mem_copy bundles the WRITE link: separable (non-blending) entity store +
     # position-resolved memory (no time mean-pool), so the copy can be sourced
@@ -486,7 +767,8 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
                     mem_copy=mem_copy, write_mode=write_mode,
                     no_meanpool=no_meanpool, oracle_bind=oracle_bind,
                     id_key=id_key, name_transport=name_transport,
-                    name_lookback=name_lookback, conc_gate=conc_gate)
+                    name_lookback=name_lookback, conc_gate=conc_gate,
+                    write_decay=write_decay, erase=erase)
     start_step = int(ckpt.get("step", 0)) if resume else 0
 
     model = SpiderWeb(cfg).to(device)
@@ -513,6 +795,20 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
           f"(k={N_ENTITIES_CHOICES if MULTI_ENTITY else 1}; supervision target = "
           f"{'CUE subject intro (selective)' if MULTI_ENTITY else 'single entity'})",
           flush=True)
+    print(f"[as] TRANSFER={TRANSFER} transfer_frac={TRANSFER_FRAC} "
+          f"(ownership-UPDATE stories; Step 6 two-object GIVER: giver holds objT+objK, "
+          f"transfers objT; new-owner recall->objT (needs recency), old-owner "
+          f"recall->objK KEPT (needs suppression of objT); recipient-before-object "
+          f"frames; rest no-transfer controls)"
+          if TRANSFER else "[as] TRANSFER=False", flush=True)
+    _decay_msg = ("DECAY-ON-WRITE: slot<-γ·slot+write; newer writes dominate within a slot"
+                  if write_decay < 1.0 else "off (γ=1, additive — Step-5 behavior)")
+    print(f"[as] WRITE_DECAY(γ)={write_decay} ({_decay_msg})", flush=True)
+    print(f"[as] ERASE={erase} "
+          f"(NTM targeted erase: 2nd lookback resolves GIVER (giver_src, L_name) -> "
+          f"slot<-slot·(1-e·w_giver) at the transfer clause; erase gate zero-init "
+          f"(starts OFF), learned from the old-owner (KEPT) recall NLL)"
+          if erase else "[as] ERASE=False", flush=True)
     print(f"[as] ORACLE_BIND={oracle_bind} "
           f"(slot key/query hard-wired to SUBJECT token id, bypass content router)"
           if oracle_bind else "[as] ORACLE_BIND=False (learned content router)",
@@ -598,16 +894,18 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
                     "name_transport": name_transport,
                     "name_lookback": name_lookback, "w_name": w_name,
                     "content_addr": content_addr, "w_entropy": w_entropy,
-                    "conc_gate": conc_gate}, path)
+                    "conc_gate": conc_gate, "transfer": transfer,
+                    "write_decay": write_decay, "erase": erase,
+                    "transfer_frac": TRANSFER_FRAC}, path)
 
     print(f"[as] {'Step':>6} {'CE':>8} {'EMA':>8} {'genCE':>7} {'attnL':>7} "
           f"{'mass':>6} {'lam':>6} {'lamRcl':>6} {'rout':>6} {'tau':>5} | "
           f"{'gnorm':>7}", flush=True)
     for step in range(start_step, steps):
-        x, y, rp, sp_pos, isb, subj, nsrc = next_batch()
+        x, y, rp, sp_pos, isb, subj, nsrc, gsrc = next_batch()
         x, y = x.to(device), y.to(device)
         rp, sp_pos, isb = rp.to(device), sp_pos.to(device), isb.to(device)
-        subj = subj.to(device); nsrc = nsrc.to(device)
+        subj = subj.to(device); nsrc = nsrc.to(device); gsrc = gsrc.to(device)
         tau = tau_sched.get_temp(step)
         # oracle anneal: alpha 1->0 linearly, handing routing to the learned router
         # while value/emit stay trained (distillation). alpha=1 unless annealing.
@@ -656,6 +954,14 @@ def run(batch_size, w_attn, out_dir, steps, resume=False,
             name_loss, name_mass, name_acc, n_nm = name_supervision(out, nsrc)
             if w_name > 0:
                 loss = loss + w_name * name_loss
+            # GIVER link (Step 6 erase): supervise the SECOND lookback toward the
+            # giver at the transfer clause (giver_src as TARGET only). Same L_name
+            # machinery, applied to out["giver_stats"]. Only present under --erase;
+            # weighted by the same w_name. name_src OFF in the forward as always.
+            giver_loss, giver_mass, giver_acc, n_gv = name_supervision(
+                out, gsrc, stats_key="giver_stats")
+            if w_name > 0 and erase:
+                loss = loss + w_name * giver_loss
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"[as] *** NaN/Inf at step {step}. Stopping. ***", flush=True)
             return True
@@ -809,6 +1115,23 @@ def main():
                     help="re-source the copy gate lambda from read-concentration stats "
                          "[read_max, read_entropy] ('stats') or those + x ('stats_x') instead "
                          "of copy_gate(x) ('off'). Lexicon-invariant gate input; floor still applies.")
+    ap.add_argument("--transfer", action="store_true",
+                    help="Step 5/6: binding UPDATE / ownership transfer data. Two-object "
+                         "giver transfers one object; new-owner recall targets the "
+                         "transferred obj, old-owner the KEPT obj. Implies --multi_entity. "
+                         "(auto-on with --write_decay<1 or --erase.)")
+    ap.add_argument("--write_decay", type=float, default=1.0,
+                    help="Step 6 DECAY-ON-WRITE (recency): γ in (0,1]; when a slot is "
+                         "written it is first scaled by (1-(1-γ)·strength) so newer writes "
+                         "dominate within a slot. γ=1.0 -> off (additive, Step-5 behavior).")
+    ap.add_argument("--erase", action="store_true",
+                    help="Step 6 TARGETED ERASE (NTM-style): a second learned lookback "
+                         "resolves the GIVER at the transfer clause (giver_src, L_name) and a "
+                         "zero-init erase gate applies slot<-slot·(1-e·w_giver), suppressing "
+                         "the giver's slot for later reads. Learned from the old-owner NLL.")
+    ap.add_argument("--transfer_frac", type=float, default=None,
+                    help="Step 6: fraction of binding examples that transfer (default 0.35, "
+                         "lower than Step-5's 0.5 to guard the plain-binding regression).")
     a = ap.parse_args()
     for bs in (48, 32, 24, 16):
         try:
@@ -822,7 +1145,9 @@ def main():
                 name_transport=a.name_transport,
                 name_lookback=a.name_lookback, w_name=a.w_name,
                 content_addr=a.content_addr, w_entropy=a.w_entropy,
-                conc_gate=a.conc_gate); return
+                conc_gate=a.conc_gate, transfer=a.transfer,
+                write_decay=a.write_decay, erase=a.erase,
+                transfer_frac=a.transfer_frac); return
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             print(f"[as] OOM at batch={bs}, falling back.", flush=True)

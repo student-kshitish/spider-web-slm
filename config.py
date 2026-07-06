@@ -101,6 +101,24 @@ class ModelConfig:
                                    #     the model must find the name on its own. Supersedes the
                                    #     name_transport oracle (only changed variable: how the
                                    #     name reaches the key — gather -> learned lookback).
+    # ── Step 6: write-policy primitives (native slot-memory ops, NTM-style) ─────
+    # The Step-5 finding was that the separable store is ADDITIVE accumulation with
+    # no ordering and no deletion. These add exactly those two write policies to
+    # SeparableMemoryRead's (closed-form) slot memory; both default to a no-op so
+    # warm-started checkpoints are unaffected.
+    write_decay: float = 1.0       # DECAY-ON-WRITE (recency): when position u writes to
+                                   #     slot s with strength a=write_w*gate, existing
+                                   #     content is scaled by (1-(1-γ)a) BEFORE the add, so
+                                   #     newer writes dominate within a slot. γ=1.0 -> no
+                                   #     decay (identity, the Step-5 behavior). Folds into the
+                                   #     read as a per-slot cumulative decay (exact, keeps the
+                                   #     per-position read_dist diagnostic).
+    erase: bool = False            # TARGETED ERASE (NTM-style): a SECOND learned name-lookback
+                                   #     (web.py self.giver_lookback) resolves the GIVER; a
+                                   #     zero-init erase gate e=sigmoid(erase_gate(x)) applies
+                                   #     slot <- slot*(1 - e*w_giver) at the (learned) transfer
+                                   #     position, suppressing the giver's slot for later reads.
+                                   #     Zero-init -> erase starts OFF (warm-compatible).
     no_meanpool: bool = False      # (4) DON'T collapse the T axis when writing node memory
                                    #     (web.py:172). Registry stays position-resolved
                                    #     (B,T,slots,d) so an entity written at position k is

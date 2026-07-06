@@ -38,7 +38,7 @@ def make_batch(sp, device):
     ds.sp = sp; ds.rng = random.Random(SEED); ds.n = 1000
     xs, ys, rps, sps, isbs, subjs, nss = [], [], [], [], [], [], []
     for _ in range(B):
-        x, y, rp, sp_pos, isb, s, ns = ds._binding_multi()
+        x, y, rp, sp_pos, isb, s, ns, gs = ds._binding_multi()   # 8-tuple (gs unused here)
         xs.append(x); ys.append(y); rps.append(rp); sps.append(sp_pos)
         isbs.append(isb); subjs.append(s); nss.append(ns)
     stack = lambda L: torch.stack(L).to(device)

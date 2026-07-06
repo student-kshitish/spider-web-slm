@@ -84,6 +84,13 @@ class SpiderWeb(nn.Module):
         # is supervised toward name_src in training, but name_src NEVER enters the
         # forward — at inference it must locate the name unaided.
         self.name_lookback = NameLookback(config)
+        # ── Step 6 (--erase): a SECOND name-lookback that resolves the GIVER at the
+        # transfer clause. Its output forms the giver's slot key for the NTM erase
+        # slot<-slot*(1-e*w_giver). Its attention is supervised toward the giver
+        # position (L_name pattern, giver_src) — train only, located unaided at
+        # inference. Only built when erase is on (else its params would be unused).
+        if getattr(config.model, "erase", False):
+            self.giver_lookback = NameLookback(config)
 
     def forward(self, input_ids, tau=1.0, hard=False, return_ring_stats=False,
                 use_query_read=None, use_struct_read=None, struct_mask=None,
@@ -359,6 +366,7 @@ class SpiderWeb(nn.Module):
         write_mode = getattr(self.cfg.memory, "write_mode", "blend")
         sep_stats = None
         name_stats = None                 # name-lookback attn/name_hat, or None (off)
+        giver_stats = None                # giver-lookback attn (erase), or None (off)
         if write_mode == "separable":
             ob = getattr(self.cfg.model, "oracle_bind", False)
             # IDENTITY-KEY ADDRESSING: feed the slot key/query from the raw token
@@ -390,9 +398,17 @@ class SpiderWeb(nn.Module):
                 name_hat, name_stats = self.name_lookback(x, tok_emb)
                 id_key = name_hat                                          # learned lookback OUTPUT feeds the key
                 name_stats["name_hat"] = name_hat                          # on-graph; == id_key (wiring check)
+            # Step 6 erase: resolve the GIVER (second lookback) -> giver slot key.
+            giver_key_in = None
+            if getattr(self.cfg.model, "erase", False):
+                tok_emb2 = self.embed(input_ids)
+                giver_hat, giver_stats = self.giver_lookback(x, tok_emb2)
+                giver_key_in = giver_hat                                   # feeds erase w_giver
+                giver_stats["name_hat"] = giver_hat
             x, sep_stats = self.separable_mem(x, causal=True,
                                               subj_id=subj_id, oracle_bind=ob,
-                                              id_key=id_key, oracle_alpha=oracle_alpha)
+                                              id_key=id_key, oracle_alpha=oracle_alpha,
+                                              giver_key_in=giver_key_in)
 
         # ── UNIFIED HYBRID: surgical gated lookback attention ─────────────────
         # Spider Web routing above is untouched; this adds gated content
@@ -522,6 +538,7 @@ class SpiderWeb(nn.Module):
             "write_mode":       write_mode,
             "sep_stats":        sep_stats,        # gate/routing stats, or None (blend)
             "name_stats":       name_stats,       # name-lookback attn + name_hat, or None
+            "giver_stats":      giver_stats,      # giver-lookback attn (erase), or None
             "use_hybrid":       use_hyb,
             "hybrid_stats":     hybrid_stats,     # lookback gate stats, or None (off)
             "use_pointer":      use_ptr,
