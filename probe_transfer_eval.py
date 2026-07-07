@@ -207,8 +207,12 @@ def main():
     c1, c5, r1, afc, mc, mr, lo, lr, nn = PM.measure(
         model, device, sp, test_objs, 0, use_ptr, mem_copy,
         name_lookback=nlook)
+    mg = PM.LAST_MARGIN
     print(f"held-out  cue-top5={100*c5:.1f}%  2AFC(cue>recency)={100*afc:.1f}%  "
           f"recency1={100*r1:.1f}%  readCue={mc:.3f} readRec={mr:.3f}  n={nn}")
+    print(f"  read-mass margin m_i=readCue_i-readRec_i:  E[m]={mg['mean']:.3f}  "
+          f"SD[m]={mg['sd']:.3f}  P(m>0)={100*mg['ppos']:.1f}%  (E[m]=MASS gap; "
+          f"P(m>0)=SELECTIVITY, tracks 2AFC)")
     print(f"  reference: content_addr_A held-out 2AFC = 74.2% (Step-3 baseline). "
           f"Compare: {100*afc:.1f}%  -> "
           f"{'NO regression' if afc >= 0.70 else 'DEGRADED'}")

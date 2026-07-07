@@ -33,6 +33,13 @@ CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/mem_integrated/best.pt
 N    = int(sys.argv[2]) if len(sys.argv) > 2 else 120
 P.CKPT = CKPT
 
+# Side-channel set by measure() each call: per-item read-mass margin stats for the
+# mass-vs-selectivity dissociation. m_i = readCue_i - readRec_i.  E[m] is the mean
+# read gap (MASS, a first moment); SD[m] its per-item spread; P(m>0) the fraction of
+# items where the cue read actually beats the recency read (SELECTIVITY). Kept off
+# the return tuple so the 9-value unpack at every call site is untouched.
+LAST_MARGIN = None
+
 
 def single_tok(sp, words):
     """keep only words that are exactly one '▁word' token (so piece_to_id works)."""
@@ -98,6 +105,7 @@ def measure(model, device, sp, objs, seed, use_ptr, mem_copy, oracle=False,
     rng = random.Random(seed)
     cue1 = cue5 = rec1 = afc = 0
     m_cue = m_rec = 0.0
+    margins = []                         # per-item readCue_i - readRec_i (read-mass margin)
     loc_obj_hit = loc_obj_tot = 0        # name-loc: object-intro -> clause subject
     loc_rec_hit = 0                      # name-loc: recall -> cue name
     n = 0
@@ -174,8 +182,20 @@ def measure(model, device, sp, objs, seed, use_ptr, mem_copy, oracle=False,
                else out["hybrid_stats"]["attn"][0, -1].float()
                if use_ptr and out.get("hybrid_stats") else None)
         if row is not None:
-            m_cue += row[cs].item(); m_rec += row[rs].item()
+            mc_i = row[cs].item(); mr_i = row[rs].item()
+            m_cue += mc_i; m_rec += mr_i
+            margins.append(mc_i - mr_i)
         n += 1
+    # per-item read-mass margin stats (side-channel; sample SD, ddof=1)
+    global LAST_MARGIN
+    if margins:
+        mm = sum(margins) / len(margins)
+        sd = (sum((x - mm) ** 2 for x in margins) / max(1, len(margins) - 1)) ** 0.5
+        ppos = sum(1 for x in margins if x > 0) / len(margins)
+        LAST_MARGIN = dict(mean=mm, sd=sd, ppos=ppos, n=len(margins))
+    else:
+        LAST_MARGIN = dict(mean=float("nan"), sd=float("nan"),
+                           ppos=float("nan"), n=0)
     if n == 0:
         return (float("nan"),) * 8 + (0,)
     loc_obj = (loc_obj_hit / loc_obj_tot) if loc_obj_tot else float("nan")
@@ -257,19 +277,24 @@ def main():
           f"held-out={len(test_objs)} | cue=NON-recent, recency=distractor\n")
     loc_hdr = f" | {'locObj':>7} {'locRec':>7}" if nlook else ""
     print(f"{'group':<16} {'cue-top1':>9} {'cue-top5':>9} {'recency1':>9} "
-          f"{'2AFC':>6} | {'readCue':>8} {'readRec':>8}{loc_hdr}")
-    print("-" * (74 + (18 if nlook else 0)))
+          f"{'2AFC':>6} | {'readCue':>8} {'readRec':>8} | {'E[m]':>7} {'SD[m]':>7} "
+          f"{'P(m>0)':>7}{loc_hdr}")
+    print("-" * (100 + (18 if nlook else 0)))
     for tag, objs in [("TRAINED", train_objs), ("HELD-OUT", test_objs)]:
         c1, c5, r1, afc, mc, mr, lo, lr, nn = measure(
             model, device, sp, objs, 0, use_ptr, mem_copy, oracle=oracle,
             name_transport=ntrans, name_lookback=nlook)
+        mg = LAST_MARGIN
         loc_col = f" | {100*lo:>6.1f}% {100*lr:>6.1f}%" if nlook else ""
         print(f"{tag:<16} {100*c1:>8.1f}% {100*c5:>8.1f}% {100*r1:>8.1f}% "
-              f"{100*afc:>5.1f}% | {mc:>8.3f} {mr:>8.3f}{loc_col}")
-    print("-" * (74 + (18 if nlook else 0)))
+              f"{100*afc:>5.1f}% | {mc:>8.3f} {mr:>8.3f} | {mg['mean']:>7.3f} "
+              f"{mg['sd']:>7.3f} {100*mg['ppos']:>6.1f}%{loc_col}")
+    print("-" * (100 + (18 if nlook else 0)))
     print("cue-top5 = REAL selective binding | recency1 = shortcut rate (want LOW)")
     print("2AFC = P(cue>recency), chance 50% | readCue/readRec = retrieval mass at "
           "cue vs recency source")
+    print("m_i = readCue_i - readRec_i (per-item read-mass margin) | E[m] = MASS gap "
+          "(mean) | SD[m] = per-item spread | P(m>0) = read-mass SELECTIVITY")
     if nlook:
         print("locObj = lookback a[obj] argmax hits clause subject | "
               "locRec = a[recall] argmax hits cue name (name-localization accuracy)")
